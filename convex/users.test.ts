@@ -120,12 +120,63 @@ function makeCtx() {
   };
 }
 
-function makeListCtx(users: Array<Record<string, unknown>>) {
+function makeListCtx(
+  users: Array<Record<string, unknown>>,
+  options?: {
+    publishersByHandle?: Record<string, Record<string, unknown>>;
+    usersById?: Record<string, Record<string, unknown>>;
+  },
+) {
   const take = vi.fn(async (n: number) => users.slice(0, n));
   const collect = vi.fn(async () => users);
   const order = vi.fn(() => ({ take, collect }));
-  const query = vi.fn(() => ({ order }));
-  const get = vi.fn();
+  const publishersByHandle = options?.publishersByHandle ?? {};
+  const usersById = options?.usersById ?? {};
+  const query = vi.fn((table: string) => {
+    if (table === "users") {
+      return {
+        order,
+        withIndex: (
+          name: string,
+          cb?: (q: { eq: (field: string, value: string) => unknown }) => unknown,
+        ) => {
+          if (name !== "handle") throw new Error(`Unexpected users index ${name}`);
+          let handle = "";
+          cb?.({
+            eq: (field: string, value: string) => {
+              if (field === "handle") handle = value;
+              return {};
+            },
+          });
+          return {
+            unique: vi.fn(async () =>
+              users.find((user) => typeof user.handle === "string" && user.handle === handle) ?? null,
+            ),
+          };
+        },
+      };
+    }
+    if (table === "publishers") {
+      return {
+        withIndex: (
+          name: string,
+          cb?: (q: { eq: (field: string, value: string) => unknown }) => unknown,
+        ) => {
+          if (name !== "by_handle") throw new Error(`Unexpected publishers index ${name}`);
+          let handle = "";
+          cb?.({
+            eq: (field: string, value: string) => {
+              if (field === "handle") handle = value;
+              return {};
+            },
+          });
+          return { unique: vi.fn(async () => publishersByHandle[handle] ?? null) };
+        },
+      };
+    }
+    throw new Error(`Unexpected table ${table}`);
+  });
+  const get = vi.fn(async (id: string) => usersById[id] ?? null);
   return {
     ctx: { db: { query, get, normalizeId: vi.fn() } } as never,
     take,
@@ -897,6 +948,81 @@ describe("users.list", () => {
     expect(result.items[0]?.handle).toBe("alice");
   });
 
+  it("includes an exact older handle match outside the bounded scan", async () => {
+    vi.mocked(requireUser).mockResolvedValue({
+      userId: "users:admin",
+      user: { _id: "users:admin", role: "admin" },
+    } as never);
+    const users = [
+      ...Array.from({ length: 500 }, (_value, index) => ({
+        _id: `users:recent-${index}`,
+        _creationTime: 10_000 - index,
+        handle: `recent-${index}`,
+        role: "user",
+      })),
+      { _id: "users:older", _creationTime: 1, handle: "alice", role: "user" },
+    ];
+    const { ctx, take, collect } = makeListCtx(users);
+    const listHandler = (
+      list as unknown as { _handler: (ctx: unknown, args: unknown) => Promise<unknown> }
+    )._handler;
+
+    const result = (await listHandler(ctx, { limit: 50, search: "alice" })) as {
+      items: Array<Record<string, unknown>>;
+      total: number;
+    };
+
+    expect(take).toHaveBeenCalledWith(500);
+    expect(collect).not.toHaveBeenCalled();
+    expect(result.total).toBe(1);
+    expect(result.items[0]?._id).toBe("users:older");
+  });
+
+  it("includes an exact personal publisher handle match without a full collect", async () => {
+    vi.mocked(requireUser).mockResolvedValue({
+      userId: "users:admin",
+      user: { _id: "users:admin", role: "admin" },
+    } as never);
+    const users = [{ _id: "users:1", _creationTime: 2, handle: "alice", role: "user" }];
+    const { ctx, take, collect } = makeListCtx(users, {
+      publishersByHandle: {
+        lmlukef: {
+          _id: "publishers:lmlukef",
+          kind: "user",
+          handle: "lmlukef",
+          linkedUserId: "users:owner",
+        },
+      },
+      usersById: {
+        "users:owner": {
+          _id: "users:owner",
+          _creationTime: 1,
+          handle: "luke",
+          name: "different-gh-login",
+          displayName: "Luke",
+          role: "user",
+        },
+      },
+    });
+    const listHandler = (
+      list as unknown as { _handler: (ctx: unknown, args: unknown) => Promise<unknown> }
+    )._handler;
+
+    const result = (await listHandler(ctx, { limit: 50, search: "lmLukeF" })) as {
+      items: Array<Record<string, unknown>>;
+      total: number;
+    };
+
+    expect(take).toHaveBeenCalledWith(500);
+    expect(collect).not.toHaveBeenCalled();
+    expect(result.total).toBe(1);
+    expect(result.items[0]).toMatchObject({
+      _id: "users:owner",
+      handle: "luke",
+      displayName: "Luke",
+    });
+  });
+
   it("clamps large limit and search scan size", async () => {
     vi.mocked(requireUser).mockResolvedValue({
       userId: "users:admin",
@@ -1024,11 +1150,10 @@ describe("users.searchInternal", () => {
     await expect(handler(ctx, { actorUserId: "users:missing" })).rejects.toThrow("Unauthorized");
   });
 
-  it("searches across the full user list and returns mapped fields", async () => {
+  it("uses bounded scan and returns mapped fields", async () => {
     const users = [
-      { _id: "users:1", _creationTime: 3, handle: "zoe", name: "zoe", role: "user" },
-      { _id: "users:2", _creationTime: 2, handle: "bob", name: "bob", role: "moderator" },
-      { _id: "users:3", _creationTime: 1, handle: "alice", name: "alice", role: "user" },
+      { _id: "users:1", _creationTime: 2, handle: "alice", name: "alice", role: "user" },
+      { _id: "users:2", _creationTime: 1, handle: "bob", name: "bob", role: "moderator" },
     ];
     const { ctx, take, collect, get } = makeListCtx(users);
     const handler = (
@@ -1045,12 +1170,12 @@ describe("users.searchInternal", () => {
       total: number;
     };
 
-    expect(collect).toHaveBeenCalledTimes(1);
-    expect(take).not.toHaveBeenCalled();
+    expect(take).toHaveBeenCalledWith(500);
+    expect(collect).not.toHaveBeenCalled();
     expect(result.total).toBe(1);
     expect(result.items).toEqual([
       {
-        userId: "users:3",
+        userId: "users:1",
         handle: "alice",
         displayName: null,
         name: "alice",

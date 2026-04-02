@@ -2,7 +2,7 @@ import { getAuthUserId } from "@convex-dev/auth/server";
 import { v } from "convex/values";
 import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
-import type { ActionCtx, MutationCtx } from "./_generated/server";
+import type { ActionCtx, MutationCtx, QueryCtx } from "./_generated/server";
 import { internalAction, internalMutation, internalQuery, mutation, query } from "./functions";
 import { assertAdmin, assertModerator, requireUser } from "./lib/access";
 import { syncGitHubProfile } from "./lib/githubAccount";
@@ -362,17 +362,12 @@ function normalizeSearchQuery(search?: string) {
   return trimmed ? trimmed : undefined;
 }
 
+function computeUserSearchScanLimit(limit: number) {
+  return clampInt(limit * 10, MIN_USER_SEARCH_SCAN, MAX_USER_SEARCH_SCAN);
+}
+
 async function queryUsersForAdminList(
-  ctx: {
-    db: {
-      query: (table: "users") => {
-        order: (order: "desc") => {
-          take: (n: number) => Promise<Doc<"users">[]>;
-          collect: () => Promise<Doc<"users">[]>;
-        };
-      };
-    };
-  },
+  ctx: Pick<QueryCtx, "db">,
   args: { limit: number; search?: string },
 ) {
   const normalizedSearch = normalizeSearchQuery(args.search);
@@ -383,9 +378,19 @@ async function queryUsersForAdminList(
     return { items, total: items.length };
   }
 
-  const scannedUsers = await orderedUsers.collect();
+  const scannedUsers = await orderedUsers.take(computeUserSearchScanLimit(args.limit));
   const result = buildUserSearchResults(scannedUsers, normalizedSearch);
-  return { items: result.items.slice(0, args.limit), total: result.total };
+  const exactHandleUser = await getUserByHandleOrPersonalPublisher(ctx, args.search);
+  const includesExactHandleUser = exactHandleUser
+    ? result.items.some((user) => user._id === exactHandleUser._id)
+    : false;
+  const items = exactHandleUser
+    ? [exactHandleUser, ...result.items.filter((user) => user._id !== exactHandleUser._id)]
+    : result.items;
+  return {
+    items: items.slice(0, args.limit),
+    total: result.total + (exactHandleUser && !includesExactHandleUser ? 1 : 0),
+  };
 }
 
 function clampInt(value: number, min: number, max: number) {
