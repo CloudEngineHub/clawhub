@@ -227,6 +227,16 @@ afterEach(() => {
 });
 
 describe("package commands", () => {
+  it("rejects npm pack file/ancestor collisions before extraction", () => {
+    const bytes = npmPackFixture({
+      "package/package.json": JSON.stringify({ name: "demo", version: "1.0.0" }),
+      "package/a": "file",
+      "package/a/b": "child",
+    });
+
+    expect(() => parseClawPack(bytes)).toThrow("file/ancestor path collision");
+  });
+
   it("validates a local plugin package with bundled Plugin Inspector offline", async () => {
     const workdir = await makeTmpWorkdir();
     try {
@@ -1946,7 +1956,7 @@ describe("package commands", () => {
     }
   });
 
-  it("rejects a ClawPack tarball without openclaw.plugin.json", async () => {
+  it("rejects a code plugin ClawPack tarball without openclaw.plugin.json", async () => {
     const workdir = await makeTmpWorkdir();
     try {
       const packName = "demo-plugin-1.0.0.tgz";
@@ -1964,11 +1974,49 @@ describe("package commands", () => {
 
       await expect(
         cmdPublishPackage(makeOpts(workdir), packName, {
+          family: "code-plugin",
           sourceRepo: "openclaw/demo-plugin",
           sourceCommit: "abc123",
         }),
-      ).rejects.toThrow("ClawPack must contain package/openclaw.plugin.json");
+      ).rejects.toThrow("openclaw.plugin.json required");
       expect(httpMocks.apiRequestForm).not.toHaveBeenCalled();
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes a Claw tarball without a plugin manifest", async () => {
+    const workdir = await makeTmpWorkdir();
+    try {
+      const packName = "demo-claw-1.0.0.tgz";
+      await writeFile(
+        join(workdir, packName),
+        npmPackFixture({
+          "package/package.json": JSON.stringify({
+            name: "demo-claw",
+            version: "1.0.0",
+            openclaw: { claw: "CLAW.md" },
+          }),
+          "package/CLAW.md": "---\nschemaVersion: 1\nagent:\n  id: demo-claw\n---\n# Demo Claw\n",
+        }),
+      );
+      httpMocks.apiRequestForm.mockResolvedValueOnce({
+        ok: true,
+        packageId: "pkg_claw",
+        releaseId: "rel_claw",
+      });
+
+      await cmdPublishPackage(makeOpts(workdir), packName);
+
+      expect(getPublishPayload()).toMatchObject({
+        name: "demo-claw",
+        family: "claw",
+        version: "1.0.0",
+      });
+      const uploaded = getPublishForm().get("clawpack");
+      expect(uploaded).toBeInstanceOf(File);
+      const parsed = parseClawPack(new Uint8Array(await (uploaded as File).arrayBuffer()));
+      expect(parsed.entries.map((entry) => entry.path)).toContain("CLAW.md");
     } finally {
       await rm(workdir, { recursive: true, force: true });
     }
@@ -2521,6 +2569,134 @@ describe("package commands", () => {
       await expect(
         cmdPublishPackage(makeOpts(workdir), "demo-bundle", { family: "bundle-plugin" }),
       ).rejects.toThrow("openclaw.plugin.json required");
+      expect(httpMocks.apiRequestForm).not.toHaveBeenCalled();
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
+    }
+  });
+
+  it("detects, validates, and publishes a Claw package", async () => {
+    const workdir = await makeTmpWorkdir();
+    try {
+      const folder = join(workdir, "github-triage");
+      await mkdir(join(folder, "profiles"), { recursive: true });
+      await writeFile(
+        join(folder, "package.json"),
+        JSON.stringify({
+          name: "@acme/github-triage",
+          displayName: "GitHub Triage",
+          version: "1.0.0",
+          openclaw: { claw: "CLAW.md" },
+        }),
+        "utf8",
+      );
+      await writeFile(
+        join(folder, "CLAW.md"),
+        [
+          "---",
+          "schemaVersion: 1",
+          "agent:",
+          "  id: github-triage",
+          "  name: GitHub Triage",
+          "metadata:",
+          "  openclaw.config: profiles/openclaw.yml",
+          "---",
+          "# GitHub Triage",
+        ].join("\n"),
+        "utf8",
+      );
+      await writeFile(
+        join(folder, "profiles", "openclaw.yml"),
+        [
+          "schemaVersion: 1",
+          "agent:",
+          "  tools:",
+          "    profile: coding",
+          "    alsoAllow: [cron]",
+          "    fs:",
+          "      workspaceOnly: true",
+          "  memory:",
+          "    search:",
+          "      enabled: true",
+          "      rememberAcrossConversations: true",
+          "      sources: [memory, sessions]",
+        ].join("\n"),
+        "utf8",
+      );
+      httpMocks.apiRequestForm.mockResolvedValueOnce({
+        ok: true,
+        packageId: "pkg_claw",
+        releaseId: "rel_claw",
+      });
+
+      await cmdPublishPackage(makeOpts(workdir), "github-triage");
+
+      expect(getPublishPayload()).toMatchObject({
+        name: "@acme/github-triage",
+        family: "claw",
+        version: "1.0.0",
+      });
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects Claw manifests with malformed UTF-8 before upload", async () => {
+    const workdir = await makeTmpWorkdir();
+    try {
+      const folder = join(workdir, "invalid-utf8-claw");
+      await mkdir(folder, { recursive: true });
+      await writeFile(
+        join(folder, "package.json"),
+        JSON.stringify({
+          name: "invalid-utf8-claw",
+          displayName: "Invalid UTF-8 Claw",
+          version: "1.0.0",
+          openclaw: { claw: "CLAW.md" },
+        }),
+        "utf8",
+      );
+      await writeFile(
+        join(folder, "CLAW.md"),
+        Uint8Array.from([
+          ...new TextEncoder().encode(
+            "---\nschemaVersion: 1\nagent:\n  id: invalid-utf8-claw\n---\n# Invalid UTF-8 Claw\n",
+          ),
+          0xff,
+        ]),
+      );
+      await expect(cmdPublishPackage(makeOpts(workdir), "invalid-utf8-claw")).rejects.toThrow(
+        "CLAW.md: The declared Claw manifest is missing or is not UTF-8 text.",
+      );
+      expect(httpMocks.apiRequestForm).not.toHaveBeenCalled();
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects Claws with missing workspace sources before upload", async () => {
+    const workdir = await makeTmpWorkdir();
+    try {
+      const folder = join(workdir, "broken-claw");
+      await mkdir(folder, { recursive: true });
+      await writeFile(
+        join(folder, "package.json"),
+        JSON.stringify({
+          name: "broken-claw",
+          version: "1.0.0",
+          openclaw: { claw: "CLAW.md" },
+        }),
+        "utf8",
+      );
+      await writeFile(
+        join(folder, "CLAW.md"),
+        "---\nschemaVersion: 1\nagent:\n  id: broken-claw\nworkspace:\n  files:\n    - source: missing.md\n      path: missing.md\n---\n# Broken Claw\n",
+        "utf8",
+      );
+
+      await expect(cmdPublishPackage(makeOpts(workdir), "broken-claw")).rejects.toThrow(
+        "missing.md: Declared workspace source is missing",
+      );
       expect(httpMocks.apiRequestForm).not.toHaveBeenCalled();
     } finally {
       await rm(workdir, { recursive: true, force: true });

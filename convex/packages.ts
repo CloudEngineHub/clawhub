@@ -1,5 +1,6 @@
 import {
   ServerPackagePublishRequestSchema,
+  validateClawPackageContents,
   derivePluginCategoryTags,
   getCatalogTopicSlugs,
   getPackageScopeOwnerMismatch,
@@ -60,6 +61,7 @@ import {
   getActivityTrendRangeForEndDay,
 } from "./lib/downloadTrend";
 import { buildPackageInspectorFindingsEmail } from "./lib/emails";
+import { experimentalClawsEnabled, isClawFamilyPubliclyVisible } from "./lib/experimentalClaws";
 import { requireGitHubAccountAge } from "./lib/githubAccount";
 import { normalizeGitHubRepository } from "./lib/githubActionsOidc";
 import { readGlobalPublicPluginsCount } from "./lib/globalStats";
@@ -135,6 +137,7 @@ const MAX_PLUGIN_EXPORT_LIST_LIMIT = 250;
 const MAX_SEARCH_PAGE_SIZE = 200;
 const MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES = 20;
 const MAX_DIRECT_PACKAGE_FULL_TEXT_CANDIDATES = 40;
+const STABLE_PACKAGE_FAMILIES = ["skill", "code-plugin", "bundle-plugin"] as const;
 const MAX_PACKAGE_VERSION_DELETE_LOOKUP_CANDIDATES = 4;
 const MAX_POINTERLESS_RELEASE_SURVIVOR_SCAN = 100;
 // Release rows can approach 1 MiB, and trigger-wrapped patches materialize full documents.
@@ -916,6 +919,7 @@ type PackageDigestLike = Pick<
   | "pluginCategoryTags"
   | "verificationTier"
   | "stats"
+  | "recommendedScore"
   | "scanStatus"
   | "softDeletedAt"
 > & { pluginCategory?: string };
@@ -939,6 +943,13 @@ type PublicPackageListPage = {
   page: PublicPackageListItem[];
   isDone: boolean;
   continueCursor: string;
+};
+const STABLE_PACKAGE_DISCOVERY_CURSOR_PREFIX = "pkgstable:";
+type StablePackageFamily = (typeof STABLE_PACKAGE_FAMILIES)[number];
+type StablePackageDiscoverySourceState = { key: IndexKey | null; done: boolean };
+type StablePackageDiscoveryCursorState = {
+  sort: "updated" | "downloads" | "recommended" | "installs";
+  sources: Record<StablePackageFamily, StablePackageDiscoverySourceState>;
 };
 const OFFICIAL_FIRST_PACKAGE_CATEGORY_CURSOR_PREFIX = "pkgofficialfirst:";
 
@@ -1210,8 +1221,13 @@ function toPublicPackage(
 }
 
 function toPublicPackageRelease(release: Doc<"packageReleases">) {
-  const { capabilities: _capabilities, ...publicRelease } = release as Doc<"packageReleases"> & {
+  const {
+    capabilities: _capabilities,
+    extractedClawManifest: _extractedClawManifest,
+    ...publicRelease
+  } = release as Doc<"packageReleases"> & {
     capabilities?: unknown;
+    extractedClawManifest?: unknown;
   };
   const sourcePath = release.verification?.sourcePath ?? getReleaseSourcePath(release);
   if (!release.verification || !sourcePath) return publicRelease;
@@ -1319,6 +1335,7 @@ function digestMatchesFilters(
     excludedScanStatuses?: PackageListScanStatus[];
   },
 ) {
+  if (!isClawFamilyPubliclyVisible(digest.family)) return false;
   if (digest.scanStatus && args.excludedScanStatuses?.includes(digest.scanStatus)) return false;
   if (args.category) {
     if (digest.pluginCategory) {
@@ -1365,6 +1382,7 @@ function packageMatchesListFilters(
     excludedScanStatuses?: PackageListScanStatus[];
   },
 ) {
+  if (!isClawFamilyPubliclyVisible(pkg.family)) return false;
   if (pkg.scanStatus && args.excludedScanStatuses?.includes(pkg.scanStatus)) return false;
   if (args.family && pkg.family !== args.family) return false;
   if (args.channel && pkg.channel !== args.channel) return false;
@@ -1875,6 +1893,7 @@ function maybeNormalizePackageQuery(value: string) {
 async function resolveDirectPackageSearchDigests(
   ctx: DbReaderCtx,
   queryText: string,
+  family?: PackageFamily,
 ): Promise<PackageDigestLike[]> {
   const normalizedQuery = maybeNormalizePackageQuery(queryText);
   const topicQuery = normalizeCatalogTopic(queryText);
@@ -1894,49 +1913,85 @@ async function resolveDirectPackageSearchDigests(
     categoryDigests,
   ] = await Promise.all([
     normalizedQuery
-      ? ctx.db
-          .query("packageSearchDigest")
-          .withIndex("by_active_normalized_name", (q) =>
-            q
-              .eq("softDeletedAt", undefined)
-              .gte("normalizedName", normalizedQuery)
-              .lt("normalizedName", prefixUpperBound(normalizedQuery)),
-          )
-          .take(MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES)
+      ? family
+        ? ctx.db
+            .query("packageSearchDigest")
+            .withIndex("by_active_family_normalized_name", (q) =>
+              q
+                .eq("softDeletedAt", undefined)
+                .eq("family", family)
+                .gte("normalizedName", normalizedQuery)
+                .lt("normalizedName", prefixUpperBound(normalizedQuery)),
+            )
+            .take(MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES)
+        : ctx.db
+            .query("packageSearchDigest")
+            .withIndex("by_active_normalized_name", (q) =>
+              q
+                .eq("softDeletedAt", undefined)
+                .gte("normalizedName", normalizedQuery)
+                .lt("normalizedName", prefixUpperBound(normalizedQuery)),
+            )
+            .take(MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES)
       : Promise.resolve([]),
     runtimePrefix
-      ? ctx.db
-          .query("packageSearchDigest")
-          .withIndex("by_active_runtime_id", (q) =>
-            q
-              .eq("softDeletedAt", undefined)
-              .gte("runtimeId", runtimePrefix)
-              .lt("runtimeId", prefixUpperBound(runtimePrefix)),
-          )
-          .take(MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES)
+      ? family
+        ? ctx.db
+            .query("packageSearchDigest")
+            .withIndex("by_active_family_runtime_id", (q) =>
+              q
+                .eq("softDeletedAt", undefined)
+                .eq("family", family)
+                .gte("runtimeId", runtimePrefix)
+                .lt("runtimeId", prefixUpperBound(runtimePrefix)),
+            )
+            .take(MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES)
+        : ctx.db
+            .query("packageSearchDigest")
+            .withIndex("by_active_runtime_id", (q) =>
+              q
+                .eq("softDeletedAt", undefined)
+                .gte("runtimeId", runtimePrefix)
+                .lt("runtimeId", prefixUpperBound(runtimePrefix)),
+            )
+            .take(MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES)
       : Promise.resolve([]),
     ctx.db
       .query("packageSearchDigest")
-      .withSearchIndex("search_by_display_name", (q) =>
-        q.search("displayName", queryText).eq("softDeletedAt", undefined),
-      )
+      .withSearchIndex("search_by_display_name", (q) => {
+        const search = q.search("displayName", queryText).eq("softDeletedAt", undefined);
+        return family ? search.eq("family", family) : search;
+      })
       .take(MAX_DIRECT_PACKAGE_FULL_TEXT_CANDIDATES),
     ownerHandlePrefix
-      ? ctx.db
-          .query("packageSearchDigest")
-          .withIndex("by_active_owner_handle", (q) =>
-            q
-              .eq("softDeletedAt", undefined)
-              .gte("ownerHandle", ownerHandlePrefix)
-              .lt("ownerHandle", prefixUpperBound(ownerHandlePrefix)),
-          )
-          .take(MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES)
+      ? family
+        ? ctx.db
+            .query("packageSearchDigest")
+            .withIndex("by_active_family_owner_handle", (q) =>
+              q
+                .eq("softDeletedAt", undefined)
+                .eq("family", family)
+                .gte("ownerHandle", ownerHandlePrefix)
+                .lt("ownerHandle", prefixUpperBound(ownerHandlePrefix)),
+            )
+            .take(MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES)
+        : ctx.db
+            .query("packageSearchDigest")
+            .withIndex("by_active_owner_handle", (q) =>
+              q
+                .eq("softDeletedAt", undefined)
+                .gte("ownerHandle", ownerHandlePrefix)
+                .lt("ownerHandle", prefixUpperBound(ownerHandlePrefix)),
+            )
+            .take(MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES)
       : Promise.resolve([]),
     topicQuery
       ? ctx.db
           .query("packageTopicSearchDigest")
-          .withIndex("by_active_topic_updated", (q) =>
-            q.eq("softDeletedAt", undefined).eq("topic", topicQuery),
+          .withIndex(family ? "by_active_family_topic_updated" : "by_active_topic_updated", (q) =>
+            family
+              ? q.eq("softDeletedAt", undefined).eq("family", family).eq("topic", topicQuery)
+              : q.eq("softDeletedAt", undefined).eq("topic", topicQuery),
           )
           .order("desc")
           .take(MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES)
@@ -1944,8 +1999,15 @@ async function resolveDirectPackageSearchDigests(
     categoryQuery
       ? ctx.db
           .query("packagePluginCategorySearchDigest")
-          .withIndex("by_active_category_updated", (q) =>
-            q.eq("softDeletedAt", undefined).eq("pluginCategory", categoryQuery),
+          .withIndex(
+            family ? "by_active_family_category_updated" : "by_active_category_updated",
+            (q) =>
+              family
+                ? q
+                    .eq("softDeletedAt", undefined)
+                    .eq("family", family)
+                    .eq("pluginCategory", categoryQuery)
+                : q.eq("softDeletedAt", undefined).eq("pluginCategory", categoryQuery),
           )
           .order("desc")
           .take(MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES)
@@ -1955,11 +2017,17 @@ async function resolveDirectPackageSearchDigests(
     topicQuery && exactTopicDigests.length < MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES
       ? await ctx.db
           .query("packageTopicSearchDigest")
-          .withIndex("by_active_topic_updated", (q) =>
-            q
-              .eq("softDeletedAt", undefined)
-              .gte("topic", topicQuery)
-              .lt("topic", prefixUpperBound(topicQuery)),
+          .withIndex(family ? "by_active_family_topic_updated" : "by_active_topic_updated", (q) =>
+            family
+              ? q
+                  .eq("softDeletedAt", undefined)
+                  .eq("family", family)
+                  .gte("topic", topicQuery)
+                  .lt("topic", prefixUpperBound(topicQuery))
+              : q
+                  .eq("softDeletedAt", undefined)
+                  .gte("topic", topicQuery)
+                  .lt("topic", prefixUpperBound(topicQuery)),
           )
           .order("desc")
           .take(MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES - exactTopicDigests.length)
@@ -2634,6 +2702,7 @@ async function getReadablePackageByName(
   const normalizedName = normalizePackageName(name);
   const pkg = await getPackageByNormalizedName(ctx, normalizedName);
   if (!pkg || pkg.softDeletedAt) return null;
+  if (!isClawFamilyPubliclyVisible(pkg.family)) return null;
   if (pkg.channel === "private" || isPackageBlockedFromPublic(pkg.scanStatus)) {
     const canAccessOwner = await viewerCanAccessPackageOwner(ctx, pkg, viewerUserId);
     if (pkg.channel === "private" && !canAccessOwner) return null;
@@ -2654,6 +2723,7 @@ async function getPackageReadableForPublicTrust(
 ) {
   const pkg = await getPackageByNormalizedName(ctx, normalizePackageName(name));
   if (!pkg || pkg.softDeletedAt) return null;
+  if (!isClawFamilyPubliclyVisible(pkg.family)) return null;
   if (pkg.channel === "private" && !(await viewerCanAccessPackageOwner(ctx, pkg, viewerUserId))) {
     return null;
   }
@@ -3256,7 +3326,7 @@ export const listAuditPage = query({
     const page = [];
     const membershipCache = new Map<string, Promise<boolean>>();
     for (const pkg of result.page) {
-      if (pkg.family === "skill") continue;
+      if (pkg.family !== "code-plugin" && pkg.family !== "bundle-plugin") continue;
       if (!(await canViewerReadPackage(ctx, pkg, undefined, membershipCache))) continue;
 
       const owner = toPublicPublisher(
@@ -3374,6 +3444,91 @@ function decodePackageIndexKeyValue(val: unknown): Value | undefined {
     return undefined;
   }
   return val as Value;
+}
+
+function emptyStablePackageDiscoveryCursor(
+  sort: StablePackageDiscoveryCursorState["sort"],
+): StablePackageDiscoveryCursorState {
+  return {
+    sort,
+    sources: {
+      skill: { key: null, done: false },
+      "code-plugin": { key: null, done: false },
+      "bundle-plugin": { key: null, done: false },
+    },
+  };
+}
+
+function encodeStablePackageDiscoveryCursor(state: StablePackageDiscoveryCursorState) {
+  const sources = Object.fromEntries(
+    STABLE_PACKAGE_FAMILIES.map((family) => [
+      family,
+      {
+        key: state.sources[family].key?.map(encodePackageIndexKeyValue) ?? null,
+        done: state.sources[family].done,
+      },
+    ]),
+  );
+  return `${STABLE_PACKAGE_DISCOVERY_CURSOR_PREFIX}${JSON.stringify({
+    v: 1,
+    sort: state.sort,
+    sources,
+  })}`;
+}
+
+function readStablePackageDiscoveryCursorSort(
+  raw: string | null | undefined,
+): "updated" | "recommended" | null {
+  if (!raw?.startsWith(STABLE_PACKAGE_DISCOVERY_CURSOR_PREFIX)) return null;
+  try {
+    const parsed = JSON.parse(raw.slice(STABLE_PACKAGE_DISCOVERY_CURSOR_PREFIX.length)) as {
+      v?: unknown;
+      sort?: unknown;
+    };
+    return parsed.v === 1 && (parsed.sort === "updated" || parsed.sort === "recommended")
+      ? parsed.sort
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function decodeStablePackageDiscoveryCursor(
+  raw: string | null | undefined,
+  sort: StablePackageDiscoveryCursorState["sort"],
+): StablePackageDiscoveryCursorState {
+  const fallback = emptyStablePackageDiscoveryCursor(sort);
+  if (!raw?.startsWith(STABLE_PACKAGE_DISCOVERY_CURSOR_PREFIX)) return fallback;
+  try {
+    const parsed = JSON.parse(raw.slice(STABLE_PACKAGE_DISCOVERY_CURSOR_PREFIX.length)) as {
+      v?: unknown;
+      sort?: unknown;
+      sources?: unknown;
+    };
+    if (
+      parsed.v !== 1 ||
+      parsed.sort !== sort ||
+      !parsed.sources ||
+      typeof parsed.sources !== "object"
+    ) {
+      return fallback;
+    }
+    const sources = parsed.sources as Record<string, unknown>;
+    const decoded = emptyStablePackageDiscoveryCursor(sort);
+    for (const family of STABLE_PACKAGE_FAMILIES) {
+      const value = sources[family];
+      if (!value || typeof value !== "object") return fallback;
+      const source = value as { key?: unknown; done?: unknown };
+      if (source.key !== null && !Array.isArray(source.key)) return fallback;
+      decoded.sources[family] = {
+        key: Array.isArray(source.key) ? source.key.map(decodePackageIndexKeyValue) : null,
+        done: source.done === true,
+      };
+    }
+    return decoded;
+  } catch {
+    return fallback;
+  }
 }
 
 function encodePackageIndexCursor(indexName: string, key: IndexKey): string {
@@ -3754,6 +3909,146 @@ export const countPublicPlugins = query({
   },
 });
 
+function compareStablePackageDiscoveryCandidates(
+  a: PackageDigestLike,
+  b: PackageDigestLike,
+  sort: "updated" | "downloads" | "recommended" | "installs",
+) {
+  const metric = (candidate: PackageDigestLike) => {
+    if (sort === "downloads") return candidate.stats?.downloads ?? 0;
+    if (sort === "installs") return candidate.stats?.installs ?? 0;
+    if (sort === "recommended") return candidate.recommendedScore ?? 0;
+    return candidate.updatedAt;
+  };
+  const metricDiff = metric(b) - metric(a);
+  if (metricDiff !== 0) return metricDiff;
+  const updatedDiff = b.updatedAt - a.updatedAt;
+  if (updatedDiff !== 0) return updatedDiff;
+  const familyDiff = a.family.localeCompare(b.family);
+  if (familyDiff !== 0) return familyDiff;
+  return a.name.localeCompare(b.name);
+}
+
+async function listStablePackageDiscoveryPage(
+  ctx: DbReaderCtx,
+  args: {
+    channel?: PackageChannel;
+    isOfficial?: boolean;
+    category?: PluginCategorySlug;
+    topic?: string;
+    excludedScanStatuses?: PackageListScanStatus[];
+    sort?: "updated" | "downloads" | "recommended" | "installs";
+    viewerUserId?: Id<"users">;
+    paginationOpts: { cursor: string | null; numItems: number };
+  },
+): Promise<PublicPackageListPage> {
+  const targetCount = Math.max(
+    1,
+    Math.min(args.paginationOpts.numItems, MAX_PUBLIC_LIST_PAGE_SIZE),
+  );
+  const requestedSort = args.sort ?? "updated";
+  const cursorSort =
+    requestedSort === "recommended"
+      ? readStablePackageDiscoveryCursorSort(args.paginationOpts.cursor)
+      : null;
+  let sort = cursorSort ?? requestedSort;
+  if (!cursorSort && requestedSort === "recommended") {
+    const recommendationScoresMissing = (
+      await Promise.all(
+        STABLE_PACKAGE_FAMILIES.map(
+          async (family) => await hasMissingPackageRecommendedScore(ctx, family),
+        ),
+      )
+    ).some(Boolean);
+    if (recommendationScoresMissing) sort = "updated";
+  }
+  const cursor = decodeStablePackageDiscoveryCursor(args.paginationOpts.cursor, sort);
+  const scanLimit = Math.min(MAX_PUBLIC_LIST_PAGE_SIZE, Math.max(targetCount * 5, 50));
+  const loadFamily = async (family: StablePackageFamily) => {
+    const state = cursor.sources[family];
+    if (state.done) {
+      return { family, rows: [] as PackageDigestLike[], keys: [] as IndexKey[], hasMore: false };
+    }
+    const eqPrefix: IndexKey = [undefined, family];
+    if (sort === "updated") {
+      const result = await getPage(ctx, {
+        table: "packageSearchDigest",
+        index: "by_active_family_updated",
+        startIndexKey: state.key ?? eqPrefix,
+        startInclusive: state.key === null,
+        endIndexKey: eqPrefix,
+        endInclusive: true,
+        order: "desc",
+        absoluteMaxRows: scanLimit,
+        schema,
+      });
+      return {
+        family,
+        rows: result.page as PackageDigestLike[],
+        keys: result.indexKeys,
+        hasMore: result.hasMore,
+      };
+    }
+    const index =
+      sort === "downloads"
+        ? "by_active_family_downloads"
+        : sort === "installs"
+          ? "by_active_family_installs"
+          : "by_active_family_recommended_score";
+    const result = await getPage(ctx, {
+      table: "packages",
+      index,
+      startIndexKey: state.key ?? eqPrefix,
+      startInclusive: state.key === null,
+      endIndexKey: eqPrefix,
+      endInclusive: true,
+      order: "desc",
+      absoluteMaxRows: scanLimit,
+      schema,
+    });
+    return {
+      family,
+      rows: result.page.map(extractPackageDigestFields),
+      keys: result.indexKeys,
+      hasMore: result.hasMore,
+    };
+  };
+  const familyPages = await Promise.all(
+    STABLE_PACKAGE_FAMILIES.map(async (family) => await loadFamily(family)),
+  );
+  const membershipCache = new Map<string, Promise<boolean>>();
+  const page: PublicPackageListItem[] = [];
+  const consumedByFamily = new Map<StablePackageFamily, number>();
+  while (page.length < targetCount) {
+    // Merge only the current head from each source so every persisted source
+    // cursor advances through a contiguous prefix of that source's index order.
+    const candidate = familyPages
+      .flatMap((source) => {
+        const index = consumedByFamily.get(source.family) ?? 0;
+        const row = source.rows[index];
+        return row ? [{ family: source.family, row, key: source.keys[index] }] : [];
+      })
+      .sort((a, b) => compareStablePackageDiscoveryCandidates(a.row, b.row, sort))[0];
+    if (!candidate) break;
+    const digest = candidate.row;
+    consumedByFamily.set(candidate.family, (consumedByFamily.get(candidate.family) ?? 0) + 1);
+    cursor.sources[candidate.family].key = candidate.key;
+    if (!digestMatchesSearchFilters(digest, args)) continue;
+    if (!(await canViewerReadPackage(ctx, digest, args.viewerUserId, membershipCache))) continue;
+    page.push(await toPublicPackageListItem(ctx, digest));
+  }
+  for (const source of familyPages) {
+    const consumed = consumedByFamily.get(source.family) ?? 0;
+    cursor.sources[source.family].done = consumed === source.rows.length && !source.hasMore;
+  }
+  const hasMore = STABLE_PACKAGE_FAMILIES.some((family) => !cursor.sources[family].done);
+  return {
+    page,
+    isDone: !hasMore,
+    continueCursor: hasMore ? encodeStablePackageDiscoveryCursor(cursor) : "",
+  };
+}
+
 async function listPackagePageImpl(
   ctx: DbReaderCtx,
   args: {
@@ -3847,6 +4142,19 @@ async function listPackagePageImpl(
       numItems: targetCount,
     });
     return { page, isDone: true, continueCursor: "" };
+  }
+
+  if (!args.family && !experimentalClawsEnabled()) {
+    return await listStablePackageDiscoveryPage(ctx, {
+      channel: args.channel,
+      isOfficial: args.isOfficial,
+      category,
+      topic,
+      excludedScanStatuses: args.excludedScanStatuses,
+      sort: args.sort,
+      viewerUserId: args.viewerUserId,
+      paginationOpts: args.paginationOpts,
+    });
   }
 
   const collected: PublicPackageListItem[] = [];
@@ -4311,6 +4619,7 @@ async function searchPackagesImpl(
       topic,
     });
     const entries = highlightedEntries
+      .filter(({ digest }) => isClawFamilyPubliclyVisible(digest.family))
       .filter(
         ({ digest }) =>
           !digest.scanStatus || !args.excludedScanStatuses?.includes(digest.scanStatus),
@@ -4340,30 +4649,42 @@ async function searchPackagesImpl(
     return results;
   }
 
-  const buildSearchDigestQuery = () =>
+  const searchFamilies =
+    !args.family && !experimentalClawsEnabled()
+      ? ([...STABLE_PACKAGE_FAMILIES] as PackageFamily[])
+      : [args.family];
+  const buildSearchDigestQuery = (family: PackageFamily | undefined) =>
     topic
       ? buildPackageTopicDigestQuery(ctx, {
           topic,
-          family: args.family,
+          family,
           channel: args.channel,
           isOfficial: args.isOfficial,
         })
       : category
         ? buildPackagePluginCategoryDigestQuery(ctx, {
             category,
-            family: args.family,
+            family,
             channel: args.channel,
             isOfficial: args.isOfficial,
           })
         : buildPackageDigestQuery(ctx, {
-            family: args.family,
+            family,
             channel: args.channel,
             isOfficial: args.isOfficial,
           });
   const matches: Array<PackageSearchMatch & { package: PublicPackageListItem }> = [];
   const seen = new Set<string>();
   const directDigests =
-    category && !topic ? [] : await resolveDirectPackageSearchDigests(ctx, queryText);
+    category && !topic
+      ? []
+      : (
+          await Promise.all(
+            searchFamilies.map(
+              async (family) => await resolveDirectPackageSearchDigests(ctx, queryText, family),
+            ),
+          )
+        ).flat();
   for (const digest of directDigests) {
     if (!(await canViewPackage(digest))) continue;
     if (!digestMatchesSearchFilters(digest, { ...args, topic })) continue;
@@ -4396,37 +4717,60 @@ async function searchPackagesImpl(
           ...match,
           package: await toPublicPackageListItem(ctx, digest),
         });
-        if (authoritativeMatchCount() >= targetCount) break;
       }
     };
 
     if (topic && category) {
-      let cursor: string | null = null;
-      let isDone = false;
-      let scanPages = 0;
+      const scanStates = searchFamilies.map((family) => ({
+        family,
+        cursor: null as string | null,
+        isDone: false,
+        pagesScanned: 0,
+      }));
       let remainingScanBudget = MAX_PUBLIC_LIST_FILTER_SCAN_DOCUMENTS;
       while (
         authoritativeMatchCount() < targetCount &&
-        !isDone &&
-        scanPages < MAX_PUBLIC_LIST_FILTER_SCAN_PAGES &&
+        scanStates.some(
+          (state) => !state.isDone && state.pagesScanned < MAX_PUBLIC_LIST_FILTER_SCAN_PAGES,
+        ) &&
         remainingScanBudget > 0
       ) {
-        const pageSize = Math.min(scanLimit, remainingScanBudget);
-        const page: {
-          page: PackageDigestLike[];
-          isDone: boolean;
-          continueCursor: string;
-        } = await buildSearchDigestQuery().order("desc").paginate({ cursor, numItems: pageSize });
-        scanPages += 1;
-        remainingScanBudget -= pageSize;
-        await collectDigestMatches(page.page);
-        cursor = page.continueCursor;
-        isDone = page.isDone;
+        // Finish each round before checking the match quota so the fixed family
+        // order cannot decide global relevance or consume another family's cap.
+        for (const state of scanStates) {
+          if (
+            state.isDone ||
+            state.pagesScanned >= MAX_PUBLIC_LIST_FILTER_SCAN_PAGES ||
+            remainingScanBudget <= 0
+          ) {
+            continue;
+          }
+          const pageSize = Math.min(scanLimit, remainingScanBudget);
+          const page: {
+            page: PackageDigestLike[];
+            isDone: boolean;
+            continueCursor: string;
+          } = await buildSearchDigestQuery(state.family)
+            .order("desc")
+            .paginate({ cursor: state.cursor, numItems: pageSize });
+          state.pagesScanned += 1;
+          remainingScanBudget -= pageSize;
+          await collectDigestMatches(page.page);
+          state.cursor = page.continueCursor;
+          state.isDone = page.isDone;
+        }
       }
     } else {
-      const digests: PackageDigestLike[] = await buildSearchDigestQuery()
-        .order("desc")
-        .take(scanLimit);
+      const digests = (
+        await Promise.all(
+          searchFamilies.map(
+            async (family) =>
+              (await buildSearchDigestQuery(family)
+                .order("desc")
+                .take(scanLimit)) as PackageDigestLike[],
+          ),
+        )
+      ).flat();
       await collectDigestMatches(digests);
     }
   }
@@ -7581,11 +7925,17 @@ async function publishPackageImpl(
     rawPayload,
     "Package publish payload",
   );
+  if (payload.family === "claw" && !experimentalClawsEnabled()) {
+    throw new ConvexError("Experimental Claw publication is disabled");
+  }
   if (payload.family === "skill") {
     throw new ConvexError("Skill packages must use the skills publish flow");
   }
   const family = payload.family;
   const name = normalizePackageName(payload.name);
+  if (payload.family === "claw" && payload.name !== name) {
+    throw new ConvexError(`Claw package name must use canonical form ${name}`);
+  }
   const version = assertPackageVersion(family, payload.version);
   const existingPackage = await runQueryRef<Doc<"packages"> | null>(
     ctx,
@@ -7713,7 +8063,8 @@ async function publishPackageImpl(
   if (totalBytes > MAX_PUBLISH_TOTAL_BYTES) {
     throw new ConvexError(getPublishTotalSizeError("package"));
   }
-  const legacyZipSha256 = await sha256Hex(buildDeterministicPackageZip(legacyZipEntries));
+  const legacyZipBytes = buildDeterministicPackageZip(legacyZipEntries);
+  const legacyZipSha256 = await sha256Hex(legacyZipBytes);
 
   if (family === "code-plugin" && (!effectiveSource?.repo || !effectiveSource?.commit)) {
     throw new ConvexError("Code plugins require source repo and commit metadata");
@@ -7723,6 +8074,14 @@ async function publishPackageImpl(
     ctx,
     files,
     (path) => path === "package.json",
+    family === "claw"
+      ? {
+          exactPath: true,
+          maxBytes: 256 * 1024,
+          label: "Claw package.json",
+          strictUtf8: true,
+        }
+      : undefined,
   );
   const pluginManifestEntry = await readOptionalTextFile(
     ctx,
@@ -7746,6 +8105,23 @@ async function publishPackageImpl(
   );
 
   const packageJson = maybeParseJson(packageJsonEntry?.text);
+  const declaredClawManifestPath =
+    family === "claw" &&
+    packageJson &&
+    typeof packageJson.openclaw === "object" &&
+    packageJson.openclaw !== null &&
+    !Array.isArray(packageJson.openclaw) &&
+    typeof (packageJson.openclaw as Record<string, unknown>).claw === "string"
+      ? ((packageJson.openclaw as Record<string, unknown>).claw as string)
+      : undefined;
+  const clawManifestEntry = declaredClawManifestPath
+    ? await readOptionalTextFile(ctx, files, (path) => path === declaredClawManifestPath, {
+        exactPath: true,
+        maxBytes: 1024 * 1024,
+        label: "Claw manifest",
+        strictUtf8: true,
+      })
+    : null;
   const pluginManifest = maybeParseJson(pluginManifestEntry?.text);
   const bundleManifest = maybeParseJson(bundleManifestEntry?.text);
   const storedPackageJson = toConvexSafeJsonValue(packageJson, {
@@ -7757,11 +8133,55 @@ async function publishPackageImpl(
   const storedBundleManifest = toConvexSafeJsonValue(bundleManifest, {
     maxDepth: MAX_STORED_PACKAGE_METADATA_DEPTH,
   });
-  if (packageJson) ensurePluginNameMatchesPackage(name, packageJson);
-  if (!pluginManifest) {
+  if (family !== "claw" && packageJson) ensurePluginNameMatchesPackage(name, packageJson);
+  if (family !== "claw" && !pluginManifest) {
     throw new ConvexError("openclaw.plugin.json is required for plugin packages");
   }
-  const icon = normalizePluginManifestIcon(pluginManifest);
+  const clawValidationFiles = files.map((file) => ({
+    path: file.path,
+    ...(clawManifestEntry?.file.path === file.path ? { text: clawManifestEntry.text } : {}),
+  }));
+  let clawPackage =
+    family === "claw"
+      ? validateClawPackageContents({
+          packageName: name,
+          version,
+          packageJson,
+          files: clawValidationFiles,
+        })
+      : null;
+  if (clawPackage && !clawPackage.ok) {
+    const profilePath = clawPackage.issues.find(
+      (entry) => entry.code === "missing_openclaw_profile",
+    )?.path;
+    if (profilePath) {
+      const profileEntry = await readOptionalTextFile(ctx, files, (path) => path === profilePath, {
+        exactPath: true,
+        maxBytes: 256 * 1024,
+        label: "OpenClaw profile",
+        strictUtf8: true,
+      });
+      if (profileEntry) {
+        clawPackage = validateClawPackageContents({
+          packageName: name,
+          version,
+          packageJson,
+          files: clawValidationFiles.map((file) =>
+            file.path === profileEntry.file.path ? { ...file, text: profileEntry.text } : file,
+          ),
+        });
+      }
+    }
+  }
+  if (clawPackage && !clawPackage.ok) {
+    throw new ConvexError(
+      `Invalid Claw package: ${clawPackage.issues
+        .map((entry) => `${entry.path}: ${entry.message}`)
+        .join(" ")}`,
+    );
+  }
+  const validatedClaw = clawPackage?.ok ? clawPackage.value : undefined;
+  const icon = family === "claw" ? undefined : normalizePluginManifestIcon(pluginManifest);
   if (family === "code-plugin") {
     const validation = validateOpenClawExternalCodePluginPackageContents(
       packageJson,
@@ -7785,7 +8205,11 @@ async function publishPackageImpl(
       ? extractBundlePluginArtifacts({
           packageName: name,
           packageJson,
-          pluginManifest,
+          pluginManifest:
+            pluginManifest ??
+            (() => {
+              throw new ConvexError("openclaw.plugin.json is required for plugin packages");
+            })(),
           bundleManifest,
           bundleMetadata:
             payload.bundle || detectedBundleFormat
@@ -7807,22 +8231,32 @@ async function publishPackageImpl(
             (() => {
               throw new ConvexError("package.json is required for code plugins");
             })(),
-          pluginManifest,
+          pluginManifest:
+            pluginManifest ??
+            (() => {
+              throw new ConvexError("openclaw.plugin.json is required for plugin packages");
+            })(),
           source: effectiveSource,
         })
       : null;
 
-  const summary = summarizePackageForSearch({
-    packageName: name,
-    packageJson,
-    readmeText: readmeEntry?.text ?? null,
-  });
+  const summary =
+    validatedClaw?.summary.agent.description ||
+    validatedClaw?.summary.agent.name ||
+    summarizePackageForSearch({
+      packageName: name,
+      packageJson,
+      readmeText: readmeEntry?.text ?? null,
+    });
   let categories: string[];
   let normalizedTopics: string[];
   try {
     const declaredCategories =
       payload.categories ?? normalizeStoredPluginCategoryOverride(existingPackage?.categories);
-    categories = resolvePluginCategories({ declared: declaredCategories });
+    categories =
+      family === "claw"
+        ? (declaredCategories ?? [])
+        : resolvePluginCategories({ declared: declaredCategories });
     normalizedTopics = normalizeCatalogTopics(payload.topics ?? existingPackage?.topics);
   } catch (error) {
     throw new ConvexError(error instanceof Error ? error.message : "Invalid catalog metadata");
@@ -7836,6 +8270,7 @@ async function publishPackageImpl(
       packageJson,
       pluginManifest,
       bundleManifest,
+      clawManifest: validatedClaw?.manifest,
       source: effectiveSource,
     },
     files,
@@ -7870,12 +8305,34 @@ async function publishPackageImpl(
   const integritySha256 = await hashSkillFiles(
     files.map((file) => ({ path: file.path, sha256: file.sha256 })),
   );
-  const pluginManifestSummary = derivePluginManifestSummary({
-    pluginManifest,
-    ...(bundleManifest ? { skillManifest: bundleManifest } : {}),
-    compatibility: codeArtifacts?.compatibility ?? bundleArtifacts?.compatibility,
-    files: await withSkillMarkdownTextsForManifestSummary(ctx, files),
-  });
+  const pluginManifestSummary =
+    family === "claw"
+      ? undefined
+      : derivePluginManifestSummary({
+          pluginManifest:
+            pluginManifest ??
+            (() => {
+              throw new ConvexError("openclaw.plugin.json is required for plugin packages");
+            })(),
+          ...(bundleManifest ? { skillManifest: bundleManifest } : {}),
+          compatibility: codeArtifacts?.compatibility ?? bundleArtifacts?.compatibility,
+          files: await withSkillMarkdownTextsForManifestSummary(ctx, files),
+        });
+
+  const legacyZipStorageId =
+    payload.artifact?.kind === "npm-pack"
+      ? undefined
+      : await ctx.storage.store(
+          new Blob(
+            [
+              legacyZipBytes.buffer.slice(
+                legacyZipBytes.byteOffset,
+                legacyZipBytes.byteOffset + legacyZipBytes.byteLength,
+              ) as ArrayBuffer,
+            ],
+            { type: "application/zip" },
+          ),
+        );
 
   const packageInsertArgs = {
     actorUserId,
@@ -7902,9 +8359,10 @@ async function publishPackageImpl(
     integritySha256,
     sha256hash: legacyZipSha256,
     artifactKind: payload.artifact?.kind ?? "legacy-zip",
-    clawpackStorageId: payload.artifact?.storageId as Id<"_storage"> | undefined,
-    clawpackSha256: payload.artifact?.sha256,
-    clawpackSize: payload.artifact?.size,
+    clawpackStorageId:
+      (payload.artifact?.storageId as Id<"_storage"> | undefined) ?? legacyZipStorageId,
+    clawpackSha256: payload.artifact?.sha256 ?? legacyZipSha256,
+    clawpackSize: payload.artifact?.size ?? legacyZipBytes.byteLength,
     clawpackFormat: payload.artifact?.format,
     npmIntegrity: payload.artifact?.npmIntegrity,
     npmShasum: payload.artifact?.npmShasum,
@@ -7918,6 +8376,7 @@ async function publishPackageImpl(
     extractedPluginManifest: storedPluginManifest,
     normalizedBundleManifest: family === "bundle-plugin" ? storedBundleManifest : undefined,
     pluginManifestSummary,
+    clawManifestSummary: validatedClaw?.summary,
     source: effectiveSource,
   };
 
@@ -9807,7 +10266,12 @@ export const insertReleaseInternal = internalMutation({
     ),
     name: v.string(),
     displayName: v.string(),
-    family: v.union(v.literal("skill"), v.literal("code-plugin"), v.literal("bundle-plugin")),
+    family: v.union(
+      v.literal("skill"),
+      v.literal("code-plugin"),
+      v.literal("bundle-plugin"),
+      v.literal("claw"),
+    ),
     version: v.string(),
     publicationStatus: v.optional(v.union(v.literal("pending"), v.literal("published"))),
     changelog: v.string(),
@@ -9851,9 +10315,13 @@ export const insertReleaseInternal = internalMutation({
     extractedPluginManifest: v.optional(v.any()),
     normalizedBundleManifest: v.optional(v.any()),
     pluginManifestSummary: v.optional(v.any()),
+    clawManifestSummary: v.optional(v.any()),
     source: v.optional(v.any()),
   },
   handler: async (ctx, args) => {
+    if (args.family === "claw" && !experimentalClawsEnabled()) {
+      throw new ConvexError("Experimental Claw publication is disabled");
+    }
     const now = Date.now();
     const publicationStatus = args.publicationStatus ?? "published";
     const pendingPublication = publicationStatus === "pending";
@@ -10086,6 +10554,7 @@ export const insertReleaseInternal = internalMutation({
       extractedPluginManifest: args.extractedPluginManifest,
       normalizedBundleManifest: args.normalizedBundleManifest,
       pluginManifestSummary: args.pluginManifestSummary,
+      clawManifestSummary: args.clawManifestSummary,
       compatibility: args.compatibility,
       runtimeId: args.runtimeId,
       sourceRepo: args.sourceRepo,
