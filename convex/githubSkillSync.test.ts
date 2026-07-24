@@ -2400,6 +2400,8 @@ description: Build HTML artifacts.
           statsStars: 3,
           statsInstallsCurrent: 2,
           statsInstallsAllTime: 5,
+          statsSkillsShInstalls: 17,
+          statsGithubStars: 321,
           stats: { downloads: 7, stars: 3, installsCurrent: 2, installsAllTime: 5, versions: 0 },
           createdAt: 1,
           updatedAt: 60,
@@ -2436,6 +2438,16 @@ description: Build HTML artifacts.
       moderationReason: "pending.scan",
       statsDownloads: 7,
       statsStars: 3,
+      statsInstallsCurrent: 2,
+      statsInstallsAllTime: 5,
+      statsSkillsShInstalls: 17,
+      statsGithubStars: 321,
+      stats: {
+        downloads: 7,
+        stars: 3,
+        installsCurrent: 2,
+        installsAllTime: 5,
+      },
     });
     expect(tables.skills[0]).not.toHaveProperty("githubRemovedAt");
     expect(tables.skills[0]).not.toHaveProperty("softDeletedAt");
