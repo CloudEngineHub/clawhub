@@ -85,6 +85,28 @@ not create or mutate `skills` rows during its planning gates.
   leave native skills, download history, scan jobs, publishers, and aliases
   unchanged.
 
+## Claiming mirrored skills.sh listings
+
+Claim is a preselected entry into GitHub Skill Sync, not a separate adoption or
+scan state machine. The handoff carries the mirror's external identity plus its
+canonical GitHub repository, exact skill path, commit, and content hash.
+GitHub Skill Sync re-fetches the repository, revalidates immutable repository
+and owner IDs, and rejects the request before writes unless the selected skill
+still matches every frozen source field.
+
+After that check, the normal GitHub Skill Sync lifecycle owns creation,
+controlled replacement, scanning, and promotion. New destinations remain
+hidden while pending. Existing allowed Hosted or GitHub content remains active
+while its candidate is pending or rejected. Promotion reuses the existing
+`skills` row, so routes, metrics, bookmarks, official state, prior versions,
+and audit history stay attached to the canonical identity.
+
+The skills.sh route and `skills-sh:` install reference resolve their canonical
+GitHub repository from the stored redirect target. They remain external until
+the matching GitHub-backed skill has an allowed ClawHub verdict, then resolve
+dynamically by canonical repository plus exact path. No hosted archive or
+duplicated alias/adoption row is created for GitHub-backed content.
+
 `skills` stores the public catalog row and install state:
 
 - `installKind: "github"`

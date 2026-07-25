@@ -1,3 +1,4 @@
+import { generateKeyPairSync } from "node:crypto";
 import { getFunctionName } from "convex/server";
 import { ConvexError } from "convex/values";
 import { zipSync } from "fflate";
@@ -282,17 +283,26 @@ describe("buildGitHubSourceImport", () => {
 });
 
 describe("buildGitHubSkillSourceFetch", () => {
-  it("attaches configured GitHub auth to API and archive requests only", async () => {
+  it("uses public API auth without sending OAuth app credentials to codeload", async () => {
     const previousEnv = {
       token: process.env.GITHUB_TOKEN,
       appId: process.env.GITHUB_APP_ID,
       installationId: process.env.GITHUB_APP_INSTALLATION_ID,
       privateKey: process.env.GITHUB_APP_PRIVATE_KEY,
+      oauthClientId: process.env.AUTH_GITHUB_ID,
+      oauthClientSecret: process.env.AUTH_GITHUB_SECRET,
     };
-    process.env.GITHUB_TOKEN = "github-token";
-    delete process.env.GITHUB_APP_ID;
-    delete process.env.GITHUB_APP_INSTALLATION_ID;
-    delete process.env.GITHUB_APP_PRIVATE_KEY;
+    delete process.env.GITHUB_TOKEN;
+    const { privateKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: "pkcs1", format: "pem" },
+      publicKeyEncoding: { type: "spki", format: "pem" },
+    });
+    process.env.GITHUB_APP_ID = "3536245";
+    process.env.GITHUB_APP_INSTALLATION_ID = "987654";
+    process.env.GITHUB_APP_PRIVATE_KEY = privateKey;
+    process.env.AUTH_GITHUB_ID = "oauth-client-id";
+    process.env.AUTH_GITHUB_SECRET = "oauth-client-secret";
     const fetcher = vi.fn(async () => new Response("ok"));
     const wrapped = __test.buildGitHubSkillSourceFetch(fetcher as unknown as typeof fetch);
 
@@ -311,15 +321,22 @@ describe("buildGitHubSkillSourceFetch", () => {
       else process.env.GITHUB_APP_INSTALLATION_ID = previousEnv.installationId;
       if (previousEnv.privateKey === undefined) delete process.env.GITHUB_APP_PRIVATE_KEY;
       else process.env.GITHUB_APP_PRIVATE_KEY = previousEnv.privateKey;
+      if (previousEnv.oauthClientId === undefined) delete process.env.AUTH_GITHUB_ID;
+      else process.env.AUTH_GITHUB_ID = previousEnv.oauthClientId;
+      if (previousEnv.oauthClientSecret === undefined) delete process.env.AUTH_GITHUB_SECRET;
+      else process.env.AUTH_GITHUB_SECRET = previousEnv.oauthClientSecret;
     }
 
     const calls = fetcher.mock.calls as unknown as Array<[RequestInfo | URL, RequestInit?]>;
+    expect(calls).toHaveLength(3);
     const firstHeaders = calls[0]?.[1]?.headers as Headers;
     const secondHeaders = calls[1]?.[1]?.headers as Headers;
     const thirdInit = calls[2]?.[1];
-    expect(firstHeaders.get("Authorization")).toBe("Bearer github-token");
+    expect(firstHeaders.get("Authorization")).toBe(
+      `Basic ${btoa("oauth-client-id:oauth-client-secret")}`,
+    );
     expect(firstHeaders.get("Accept")).toBe("application/vnd.github+json");
-    expect(secondHeaders.get("Authorization")).toBe("Bearer github-token");
+    expect(secondHeaders.get("Authorization")).toBeNull();
     expect(secondHeaders.get("User-Agent")).toBe("clawhub/github-skill-source");
     expect(thirdInit).toBeUndefined();
   });
@@ -348,7 +365,13 @@ describe("configurePublicGitHubSkillSourceHandler", () => {
     expect(runMutation).not.toHaveBeenCalled();
   });
 
-  it("configures any public GitHub repo for an official publisher the user can manage", async () => {
+  it("uses Test OAuth app auth and stores a canonical lowercase repo identity", async () => {
+    vi.stubEnv("GITHUB_TOKEN", "");
+    vi.stubEnv("GITHUB_APP_ID", "");
+    vi.stubEnv("GITHUB_APP_INSTALLATION_ID", "");
+    vi.stubEnv("GITHUB_APP_PRIVATE_KEY", "");
+    vi.stubEnv("AUTH_GITHUB_ID", "oauth-client-id");
+    vi.stubEnv("AUTH_GITHUB_SECRET", "oauth-client-secret");
     const zip = zipSync({
       "skills-main/skills/aiq-deploy/SKILL.md": new TextEncoder().encode("# AIQ Deploy\n"),
     });
@@ -413,10 +436,16 @@ describe("configurePublicGitHubSkillSourceHandler", () => {
     );
 
     expect(result).toEqual({ ok: true, stats: { discovered: 1 } });
+    const calls = fetchMock.mock.calls as unknown as Array<[RequestInfo | URL, RequestInit?]>;
+    const expectedAuthorization = `Basic ${btoa("oauth-client-id:oauth-client-secret")}`;
+    expect(new Headers(calls[0]?.[1]?.headers).get("Authorization")).toBe(expectedAuthorization);
+    expect(new Headers(calls[1]?.[1]?.headers).get("Authorization")).toBe(expectedAuthorization);
+    expect(new Headers(calls[2]?.[1]?.headers).get("Authorization")).toBeNull();
+    expect(new Headers(calls[3]?.[1]?.headers).get("Authorization")).toBe(expectedAuthorization);
     expect(runMutation).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
-        repo: "SomeoneElse/public-skills",
+        repo: "someoneelse/public-skills",
         ownerUserId: "users:publisher-owner",
         ownerPublisherId: "publishers:local",
         snapshot: expect.objectContaining({
@@ -432,6 +461,108 @@ describe("configurePublicGitHubSkillSourceHandler", () => {
         }),
       }),
     );
+  });
+
+  it("rejects a changed skills.sh selection before applying repository writes", async () => {
+    const zip = zipSync({
+      "skills-main/skills/html/SKILL.md": new TextEncoder().encode("# HTML\n"),
+    });
+    const runQuery = vi.fn(async () => ({
+      ownerUserId: "users:publisher-owner",
+      existingSource: null,
+    }));
+    const runMutation = vi.fn();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          id: 101,
+          full_name: "patrick-erichsen/skills",
+          owner: { id: 201 },
+          private: false,
+          visibility: "public",
+          default_branch: "main",
+          disabled: false,
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ sha: "1".repeat(40) }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        headers: new Headers({ "content-length": String(zip.byteLength) }),
+        body: null,
+        arrayBuffer: async () => zip.buffer.slice(zip.byteOffset, zip.byteOffset + zip.byteLength),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          id: 101,
+          full_name: "patrick-erichsen/skills",
+          owner: { id: 201 },
+          private: false,
+          visibility: "public",
+          default_branch: "main",
+          disabled: false,
+        }),
+      });
+
+    await expect(
+      configurePublicGitHubSkillSourceHandler(
+        { runQuery, runMutation, auth: { getUserIdentity: vi.fn() } } as never,
+        {
+          ownerPublisherId: "publishers:local" as never,
+          repo: "patrick-erichsen/skills",
+          expectedSkillsShSource: {
+            repo: "patrick-erichsen/skills",
+            externalId: "patrick-erichsen/skills/html",
+            path: "skills/html",
+            commit: "2".repeat(40),
+            contentHash: "3".repeat(64),
+          },
+        },
+        fetchMock as never,
+        { userId: "users:actor" as never },
+      ),
+    ).rejects.toThrow(/changed since this skills\.sh listing was observed/i);
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(runMutation).not.toHaveBeenCalled();
+  });
+
+  it("matches a skills.sh selection by exact slug, path, commit, and content hash", async () => {
+    const snapshot = await buildGitHubSkillSourceSnapshot({
+      repo: "patrick-erichsen/skills",
+      defaultBranch: "main",
+      commit: "1".repeat(40),
+      entries: {
+        "skills/html/SKILL.md": new TextEncoder().encode("---\nname: html\n---\n# HTML\n"),
+      },
+    });
+    const contentHash = snapshot.skills[0]?.contentHash;
+    if (!contentHash) throw new Error("missing fixture hash");
+    const exact = {
+      repo: "patrick-erichsen/skills",
+      externalId: "patrick-erichsen/skills/html",
+      path: "skills/html",
+      commit: snapshot.commit,
+      contentHash,
+    };
+
+    expect(() => __test.assertExactSkillsShSourceSelection(snapshot, exact)).not.toThrow();
+    for (const changed of [
+      { ...exact, repo: "openclaw/openclaw" },
+      { ...exact, externalId: "patrick-erichsen/skills/other" },
+      { ...exact, path: "skills/other" },
+      { ...exact, commit: "2".repeat(40) },
+      { ...exact, contentHash: "3".repeat(64) },
+    ]) {
+      expect(() => __test.assertExactSkillsShSourceSelection(snapshot, changed)).toThrow(
+        /changed since this skills\.sh listing was observed/i,
+      );
+    }
   });
 
   it("prefers nested catalog skill paths over duplicate plugin package copies", async () => {
