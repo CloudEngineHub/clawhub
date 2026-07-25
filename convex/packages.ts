@@ -1008,6 +1008,7 @@ type PublicPackageDoc = {
   compatibility?: Doc<"packages">["compatibility"];
   verification?: Doc<"packages">["verification"];
   artifact?: PackageArtifactSummary;
+  clawManifestSummary?: Doc<"packageReleases">["clawManifestSummary"];
   scanStatus?: Doc<"packages">["scanStatus"];
   stats: Doc<"packages">["stats"];
   createdAt: number;
@@ -1135,6 +1136,7 @@ function isPublishedPackageRelease(
   return Boolean(
     release &&
     !release.softDeletedAt &&
+    release.ownerDeletedAt === undefined &&
     (release.publicationStatus === undefined || release.publicationStatus === "published"),
   );
 }
@@ -1213,6 +1215,10 @@ function toPublicPackage(
         : isPublishedPackageRelease(latestRelease)
           ? packageArtifactSummary(latestRelease)
           : undefined,
+    clawManifestSummary:
+      pkg.family === "claw" && isPublishedPackageRelease(latestRelease)
+        ? latestRelease.clawManifestSummary
+        : undefined,
     scanStatus,
     stats: pkg.stats,
     createdAt: pkg.createdAt,
@@ -1220,9 +1226,53 @@ function toPublicPackage(
   };
 }
 
-function toPublicPackageRelease(release: Doc<"packageReleases">) {
+function toPublicPackageRelease(release: Doc<"packageReleases">, family: PackageFamily) {
+  // Package family owns this boundary; optional release metadata must not select a looser projection.
+  if (family === "claw") {
+    const sourcePath = release.verification?.sourcePath ?? getReleaseSourcePath(release);
+    return {
+      _id: release._id,
+      packageId: release.packageId,
+      version: release.version,
+      changelog: release.changelog,
+      summary: release.summary,
+      icon: release.icon,
+      distTags: release.distTags,
+      files: release.files.map((file) => ({
+        path: file.path,
+        size: file.size,
+        sha256: file.sha256,
+        contentType: file.contentType,
+      })),
+      integritySha256: release.integritySha256,
+      artifactKind: release.artifactKind,
+      clawpackSha256: release.clawpackSha256,
+      clawpackSize: release.clawpackSize,
+      clawpackFormat: release.clawpackFormat,
+      npmIntegrity: release.npmIntegrity,
+      npmShasum: release.npmShasum,
+      npmTarballName: release.npmTarballName,
+      npmUnpackedSize: release.npmUnpackedSize,
+      npmFileCount: release.npmFileCount,
+      clawManifestSummary: release.clawManifestSummary,
+      compatibility: release.compatibility,
+      runtimeId: release.runtimeId,
+      sourceRepo: release.sourceRepo,
+      verification:
+        release.verification && sourcePath
+          ? { ...release.verification, sourcePath }
+          : release.verification,
+      sha256hash: release.sha256hash,
+      vtAnalysis: release.vtAnalysis,
+      skillSpectorAnalysis: release.skillSpectorAnalysis,
+      llmAnalysis: release.llmAnalysis,
+      staticScan: release.staticScan,
+      createdAt: release.createdAt,
+    };
+  }
   const {
     capabilities: _capabilities,
+    clawManifestSummary: _clawManifestSummary,
     extractedClawManifest: _extractedClawManifest,
     ...publicRelease
   } = release as Doc<"packageReleases"> & {
@@ -1240,9 +1290,9 @@ function toPublicPackageRelease(release: Doc<"packageReleases">) {
   };
 }
 
-function toManagerPackageRelease(release: Doc<"packageReleases">) {
+function toManagerPackageRelease(release: Doc<"packageReleases">, family: PackageFamily) {
   return {
-    ...toPublicPackageRelease(release),
+    ...toPublicPackageRelease(release, family),
     softDeletedAt: release.softDeletedAt,
     ownerDeletedAt: release.ownerDeletedAt,
   };
@@ -2811,7 +2861,7 @@ export const getByName = query({
     return {
       package: publicPackage,
       latestRelease: isPublishedPackageRelease(latestRelease)
-        ? toPublicPackageRelease(latestRelease)
+        ? toPublicPackageRelease(latestRelease, pkg.family)
         : null,
       owner,
     };
@@ -3041,7 +3091,7 @@ export const getByNameForStaff = query({
     return {
       package: pkg,
       latestRelease: isPublishedPackageRelease(latestRelease)
-        ? toPublicPackageRelease(latestRelease)
+        ? toPublicPackageRelease(latestRelease, pkg.family)
         : null,
       owner,
       highlighted: highlighted
@@ -3074,7 +3124,7 @@ export const getByNameForViewerInternal = internalQuery({
     return {
       package: publicPackage,
       latestRelease: isPublishedPackageRelease(latestRelease)
-        ? toPublicPackageRelease(latestRelease)
+        ? toPublicPackageRelease(latestRelease, pkg.family)
         : null,
       owner,
     };
@@ -3093,7 +3143,7 @@ export const listVersions = query({
     const result = await paginatePublishedPackageReleases(ctx, pkg._id, args.paginationOpts);
     return {
       ...result,
-      page: result.page.map(toPublicPackageRelease),
+      page: result.page.map((release) => toPublicPackageRelease(release, pkg.family)),
     };
   },
 });
@@ -3110,7 +3160,7 @@ export const listVersionsForViewerInternal = internalQuery({
     const result = await paginatePublishedPackageReleases(ctx, pkg._id, args.paginationOpts);
     return {
       ...result,
-      page: result.page.map(toPublicPackageRelease),
+      page: result.page.map((release) => toPublicPackageRelease(release, pkg.family)),
     };
   },
 });
@@ -3152,7 +3202,7 @@ export const listVersionsForManager = query({
       ...result,
       page: result.page
         .filter((release) => isPackageReleaseRestorableByOwner(release, pkg._id, actor._id))
-        .map(toManagerPackageRelease),
+        .map((release) => toManagerPackageRelease(release, pkg.family)),
     };
   },
 });
@@ -3183,7 +3233,7 @@ export const getVersionByName = query({
     if (!publicPackage) return null;
     return {
       package: publicPackage,
-      version: toPublicPackageRelease(release),
+      version: toPublicPackageRelease(release, pkg.family),
     };
   },
 });
@@ -3214,7 +3264,7 @@ export const getVersionByNameForViewerInternal = internalQuery({
     if (!publicPackage) return null;
     return {
       package: publicPackage,
-      version: toPublicPackageRelease(release),
+      version: toPublicPackageRelease(release, pkg.family),
     };
   },
 });
@@ -3251,7 +3301,7 @@ export const getVersionSecurityByNameForViewerInternal = internalQuery({
         ...publicPackage,
         publicDownloadBlocked,
       },
-      version: toPublicPackageRelease(release),
+      version: toPublicPackageRelease(release, pkg.family),
     };
   },
 });
@@ -3284,7 +3334,12 @@ export const list = query({
 export const listPublicPage = query({
   args: {
     family: v.optional(
-      v.union(v.literal("skill"), v.literal("code-plugin"), v.literal("bundle-plugin")),
+      v.union(
+        v.literal("skill"),
+        v.literal("code-plugin"),
+        v.literal("bundle-plugin"),
+        v.literal("claw"),
+      ),
     ),
     channel: v.optional(
       v.union(v.literal("official"), v.literal("community"), v.literal("private")),
@@ -3846,7 +3901,12 @@ export const listPluginExportPageInternal = internalQuery({
 export const listPageForViewerInternal = internalQuery({
   args: {
     family: v.optional(
-      v.union(v.literal("skill"), v.literal("code-plugin"), v.literal("bundle-plugin")),
+      v.union(
+        v.literal("skill"),
+        v.literal("code-plugin"),
+        v.literal("bundle-plugin"),
+        v.literal("claw"),
+      ),
     ),
     families: v.optional(
       v.array(v.union(v.literal("skill"), v.literal("code-plugin"), v.literal("bundle-plugin"))),
@@ -4547,7 +4607,12 @@ export const searchPublic = query({
     query: v.string(),
     limit: v.optional(v.number()),
     family: v.optional(
-      v.union(v.literal("skill"), v.literal("code-plugin"), v.literal("bundle-plugin")),
+      v.union(
+        v.literal("skill"),
+        v.literal("code-plugin"),
+        v.literal("bundle-plugin"),
+        v.literal("claw"),
+      ),
     ),
     channel: v.optional(
       v.union(v.literal("official"), v.literal("community"), v.literal("private")),
@@ -4568,7 +4633,12 @@ export const searchForViewerInternal = internalQuery({
     query: v.string(),
     limit: v.optional(v.number()),
     family: v.optional(
-      v.union(v.literal("skill"), v.literal("code-plugin"), v.literal("bundle-plugin")),
+      v.union(
+        v.literal("skill"),
+        v.literal("code-plugin"),
+        v.literal("bundle-plugin"),
+        v.literal("claw"),
+      ),
     ),
     channel: v.optional(
       v.union(v.literal("official"), v.literal("community"), v.literal("private")),

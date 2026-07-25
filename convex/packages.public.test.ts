@@ -16864,24 +16864,81 @@ describe("restorePackageInternal", () => {
     expect(patch).not.toHaveBeenCalledWith("packages:demo", expect.anything());
   });
 
-  it("fails closed on Claw reads and never exposes the extracted manifest", async () => {
+  it("gates Claw named reads and exposes only the safe manifest summary when enabled", async () => {
     vi.mocked(getAuthUserId).mockResolvedValue(null);
     const previous = process.env.CLAWHUB_EXPERIMENTAL_CLAWS;
-    const clawManifestSummary = {
+    const latestClawManifestSummary = {
       schemaVersion: 1,
-      agent: { id: "demo-claw" },
-      workspace: { bootstrapFiles: ["SOUL.md"], fileCount: 0 },
-      packages: { skillCount: 0, pluginCount: 0 },
-      mcpServerCount: 0,
-      cronJobCount: 0,
+      agent: { id: "demo-claw-latest", name: "Demo Claw Latest", description: "Latest" },
+      workspace: { bootstrapFiles: ["SOUL.md"], fileCount: 1 },
+      packages: { skillCount: 1, pluginCount: 1 },
+      mcpServerCount: 1,
+      cronJobCount: 1,
     };
+    const exactClawManifestSummary = {
+      schemaVersion: 1,
+      agent: { id: "demo-claw-v1", name: "Demo Claw v1", description: "Exact" },
+      workspace: { bootstrapFiles: ["SOUL.md"], fileCount: 2 },
+      packages: { skillCount: 2, pluginCount: 1 },
+      mcpServerCount: 2,
+      cronJobCount: 2,
+    };
+    const latestRelease = makeReleaseDoc({
+      _id: "packageReleases:demo-latest",
+      version: "2.0.0",
+      changelog: "Latest release",
+      distTags: ["latest"],
+      files: [],
+      integritySha256: "latest-integrity",
+      clawManifestSummary: latestClawManifestSummary,
+      createdBy: "users:must-not-project-latest",
+      publishActor: { kind: "user", userId: "users:must-not-project-latest" },
+      extractedPackageJson: {
+        openclaw: {
+          packageCoordinate: "must-not-project-latest",
+          profile: { workspaceRoot: "must-not-project-latest", policy: "must-not-project-latest" },
+          manifest: {
+            workspace: { content: "must-not-project-latest" },
+            mcp: { command: "must-not-project-latest", env: "must-not-project-latest" },
+            cron: { schedule: "must-not-project-latest", message: "must-not-project-latest" },
+          },
+        },
+      },
+      extractedClawManifest: {
+        schemaVersion: 1,
+        agent: { id: "demo-claw-latest" },
+      },
+    });
     const { ctx } = makePackageCtx({
-      pkg: makePackageDoc({ family: "claw" }),
-      latestRelease: makeReleaseDoc({
-        clawManifestSummary,
+      pkg: makePackageDoc({
+        family: "claw",
+        latestReleaseId: "packageReleases:demo-latest",
+        latestVersionSummary: { version: "2.0.0" },
+      }),
+      latestRelease,
+      versionRelease: makeReleaseDoc({
+        _id: "packageReleases:demo-v1",
+        changelog: "Exact release",
+        distTags: [],
+        files: [],
+        integritySha256: "exact-integrity",
+        clawManifestSummary: exactClawManifestSummary,
+        createdBy: "users:must-not-project-exact",
+        publishActor: { kind: "user", userId: "users:must-not-project-exact" },
+        extractedPackageJson: {
+          openclaw: {
+            packageCoordinate: "must-not-project-exact",
+            profile: { workspaceRoot: "must-not-project-exact", policy: "must-not-project-exact" },
+            manifest: {
+              workspace: { content: "must-not-project-exact" },
+              mcp: { command: "must-not-project-exact", env: "must-not-project-exact" },
+              cron: { schedule: "must-not-project-exact", message: "must-not-project-exact" },
+            },
+          },
+        },
         extractedClawManifest: {
           schemaVersion: 1,
-          agent: { id: "demo-claw" },
+          agent: { id: "demo-claw-v1" },
           workspace: { bootstrapFiles: { "SOUL.md": { source: "workspace/SOUL.md" } } },
         },
       }),
@@ -16896,15 +16953,82 @@ describe("restorePackageInternal", () => {
 
       process.env.CLAWHUB_EXPERIMENTAL_CLAWS = "1";
       const detail = await getByNameHandler(ctx, { name: "demo-plugin" });
-      expect(detail?.latestRelease).toMatchObject({ clawManifestSummary });
+      expect(detail).toMatchObject({
+        package: { family: "claw", clawManifestSummary: latestClawManifestSummary },
+        latestRelease: { clawManifestSummary: latestClawManifestSummary },
+      });
       expect(detail?.latestRelease).not.toHaveProperty("extractedClawManifest");
+      expect(JSON.stringify(detail)).not.toContain("must-not-project");
 
       const version = await getVersionByNameHandler(ctx, {
         name: "demo-plugin",
         version: "1.0.0",
       });
-      expect(version?.version).toMatchObject({ clawManifestSummary });
+      expect(version).toMatchObject({
+        package: { family: "claw", clawManifestSummary: latestClawManifestSummary },
+        version: { clawManifestSummary: exactClawManifestSummary },
+      });
       expect(version?.version).not.toHaveProperty("extractedClawManifest");
+      expect(JSON.stringify(version)).not.toContain("must-not-project");
+    } finally {
+      if (previous === undefined) delete process.env.CLAWHUB_EXPERIMENTAL_CLAWS;
+      else process.env.CLAWHUB_EXPERIMENTAL_CLAWS = previous;
+    }
+  });
+
+  it("selects the bounded release projection from package family, not summary presence", async () => {
+    vi.mocked(getAuthUserId).mockResolvedValue(null);
+    const previous = process.env.CLAWHUB_EXPERIMENTAL_CLAWS;
+    process.env.CLAWHUB_EXPERIMENTAL_CLAWS = "1";
+    const staleSummary = {
+      schemaVersion: 1,
+      agent: { id: "stale-non-claw-summary" },
+      workspace: { bootstrapFiles: [], fileCount: 0 },
+      packages: { skillCount: 0, pluginCount: 0 },
+      mcpServerCount: 0,
+      cronJobCount: 0,
+    };
+
+    try {
+      const clawRelease = makeReleaseDoc({
+        files: [],
+        clawManifestSummary: undefined,
+        createdBy: "users:must-not-project",
+        publishActor: { kind: "user", userId: "users:must-not-project" },
+        extractedPackageJson: { privateWorkspace: "must-not-project" },
+      });
+      const { ctx: clawCtx } = makePackageCtx({
+        pkg: makePackageDoc({ family: "claw" }),
+        latestRelease: clawRelease,
+      });
+      const claw = await getByNameHandler(clawCtx, { name: "demo-plugin" });
+      expect(claw?.latestRelease).not.toHaveProperty("extractedPackageJson");
+      expect(JSON.stringify(claw)).not.toContain("must-not-project");
+
+      const ownerDeletedRelease = makeReleaseDoc({
+        files: [],
+        ownerDeletedAt: 123,
+        clawManifestSummary: staleSummary,
+        extractedPackageJson: { privateWorkspace: "must-not-project-owner-deleted" },
+      });
+      const { ctx: ownerDeletedCtx } = makePackageCtx({
+        pkg: makePackageDoc({ family: "claw" }),
+        latestRelease: ownerDeletedRelease,
+      });
+      const ownerDeleted = await getByNameHandler(ownerDeletedCtx, { name: "demo-plugin" });
+      expect(ownerDeleted).toMatchObject({ package: { latestVersion: null }, latestRelease: null });
+      expect(JSON.stringify(ownerDeleted)).not.toContain("stale-non-claw-summary");
+      expect(JSON.stringify(ownerDeleted)).not.toContain("must-not-project-owner-deleted");
+
+      const pluginPackageJson = { name: "demo-plugin", openclaw: { extensions: ["index.js"] } };
+      const pluginRelease = makeReleaseDoc({
+        clawManifestSummary: staleSummary,
+        extractedPackageJson: pluginPackageJson,
+      });
+      const { ctx: pluginCtx } = makePackageCtx({ latestRelease: pluginRelease });
+      const plugin = await getByNameHandler(pluginCtx, { name: "demo-plugin" });
+      expect(plugin?.latestRelease).toMatchObject({ extractedPackageJson: pluginPackageJson });
+      expect(plugin?.latestRelease).not.toHaveProperty("clawManifestSummary");
     } finally {
       if (previous === undefined) delete process.env.CLAWHUB_EXPERIMENTAL_CLAWS;
       else process.env.CLAWHUB_EXPERIMENTAL_CLAWS = previous;
