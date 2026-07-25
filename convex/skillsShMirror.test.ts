@@ -123,21 +123,70 @@ async function startRun(
   snapshotId: string,
   sourceTotal = 2,
   sourceSnapshotHash?: string,
+  sourceView?: "leaderboard" | "trending",
+  sourceMeasuredAt = "2026-07-22T20:14:10.881Z",
 ) {
-  return (await t.mutation(internal.skillsShMirror.startRunInternal, {
+  const run = (await t.mutation(internal.skillsShMirror.startRunInternal, {
     actor: "codex-test",
     reason: "CLAW-563 mirror test",
     snapshotId,
     ...(sourceSnapshotHash ? { sourceSnapshotHash } : {}),
+    ...(sourceView ? { sourceView } : {}),
     sourceTotal,
     sourcePageSize: 500,
-    sourceMeasuredAt: "2026-07-22T20:14:10.881Z",
+    sourceMeasuredAt,
   })) as { runId: Id<"skillsShMirrorRuns"> };
+  if (sourceSnapshotHash) {
+    await t.run(async (ctx) => {
+      const existing = (await ctx.db.query("skillsShMirrorSourcePages").collect()).find(
+        (page) => page.snapshotHash === sourceSnapshotHash && page.page === 0,
+      );
+      if (existing) return;
+      await ctx.db.insert("skillsShMirrorSourcePages", {
+        snapshotHash: sourceSnapshotHash,
+        sourceView: sourceView ?? "leaderboard",
+        page: 0,
+        sourceTotal,
+        pageLength: 1,
+        hasMore: sourceTotal > 1,
+        identityHash: "b".repeat(64),
+        contentHash: "c".repeat(64),
+        sourceBytes: 1,
+        serializedBytes: 1,
+        rows: [],
+        createdAt: Date.parse(sourceMeasuredAt),
+      });
+    });
+  }
+  return run;
+}
+
+async function completeLeaderboardRun(
+  t: ReturnType<typeof convexTest>,
+  runId: Id<"skillsShMirrorRuns">,
+  args: { legacy?: boolean; startedAt?: number; completedAt: number },
+) {
+  await t.run(async (ctx) => {
+    await ctx.db.patch(runId, {
+      status: "completed",
+      ...(args.legacy ? { sourceView: undefined } : {}),
+      ...(args.startedAt === undefined ? {} : { startedAt: args.startedAt }),
+      completedAt: args.completedAt,
+    });
+    const control = (await ctx.db.query("skillsShMirrorControls").collect())[0];
+    if (!control) throw new Error("mirror control missing");
+    await ctx.db.patch(control._id, { latestCompletedLeaderboardRunId: runId });
+  });
 }
 
 const mirrorLeaseRefs = internal.skillsShMirror as unknown as {
   claimBatchLeaseInternal: Parameters<ReturnType<typeof convexTest>["mutation"]>[0];
   releaseBatchLeaseInternal: Parameters<ReturnType<typeof convexTest>["mutation"]>[0];
+};
+
+const trendingRefs = internal.skillsShMirror as unknown as {
+  hydrateTrendingBatchInternal: Parameters<ReturnType<typeof convexTest>["mutation"]>[0];
+  processTrendingBatchInternal: Parameters<ReturnType<typeof convexTest>["mutation"]>[0];
 };
 
 let leaseSequence = 0;
@@ -159,10 +208,434 @@ async function processBatch(
   });
 }
 
+async function claimLease(
+  t: ReturnType<typeof convexTest>,
+  runId: Id<"skillsShMirrorRuns">,
+  page: number,
+  offset: number,
+) {
+  const leaseToken = `test-trending-lease:${(leaseSequence += 1)}`;
+  await t.mutation(mirrorLeaseRefs.claimBatchLeaseInternal, {
+    runId,
+    page,
+    offset,
+    leaseToken,
+  });
+  return leaseToken;
+}
+
 describe("skills.sh external mirror", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllEnvs();
+  });
+
+  it("joins trending rank onto one mirror identity without scan work", async () => {
+    useTestEnvironment();
+    const t = convexTest(schema, modules);
+    await configure(t);
+    const foundation = await startRun(t, "snapshot:foundation", 1);
+    await processBatch(t, {
+      runId: foundation.runId,
+      page: 0,
+      offset: 0,
+      pageLength: 1,
+      hasMore: false,
+      sourceTotal: 1,
+      sourceRequests: 0,
+      sourceBytes: 0,
+      rows: [githubRow],
+    });
+    await t.mutation(internal.skillsShMirror.reconcileBatchInternal, {
+      runId: foundation.runId,
+      limit: 250,
+    });
+
+    const trending = await startRun(t, "skills-sh:trending:snapshot-1", 1, undefined, "trending");
+    const leaseToken = await claimLease(t, trending.runId, 0, 0);
+    const result = await t.mutation(trendingRefs.processTrendingBatchInternal, {
+      runId: trending.runId,
+      page: 0,
+      offset: 0,
+      leaseToken,
+      pageLength: 1,
+      hasMore: false,
+      sourceTotal: 1,
+      rows: [{ externalId: githubRow.externalId, lifetimeInstalls: 17, rank: 1 }],
+    });
+
+    expect(result).toMatchObject({
+      status: "completed",
+      counts: {
+        observed: 1,
+        trendingJoined: 1,
+        trendingUpdated: 1,
+        trendingMissing: 0,
+        scansPlanned: 0,
+        scansAdmitted: 0,
+      },
+    });
+    expect(
+      await t.query(internal.skillsShMirror.getByExternalIdInternal, {
+        externalId: githubRow.externalId,
+      }),
+    ).toMatchObject({
+      externalId: githubRow.externalId,
+      trendingRank: 1,
+      trendingLifetimeInstalls: 17,
+      trendingObservedAt: Date.parse("2026-07-22T20:14:10.881Z"),
+    });
+    expect(
+      await t.run(async (ctx) => await ctx.db.query("skillsShMirrorDigests").collect()),
+    ).toHaveLength(1);
+    expect(
+      await t.run(async (ctx) => await ctx.db.query("skillsShCatalogScanAttempts").collect()),
+    ).toEqual([]);
+    expect(await t.run(async (ctx) => await ctx.db.query("securityScanJobs").collect())).toEqual(
+      [],
+    );
+  });
+
+  it("keeps trending replays idempotent and rejects stale observations", async () => {
+    useTestEnvironment();
+    const t = convexTest(schema, modules);
+    await configure(t);
+    const foundation = await startRun(t, "snapshot:foundation", 1);
+    await processBatch(t, {
+      runId: foundation.runId,
+      page: 0,
+      offset: 0,
+      pageLength: 1,
+      hasMore: false,
+      sourceTotal: 1,
+      sourceRequests: 0,
+      sourceBytes: 0,
+      rows: [githubRow],
+    });
+    await t.mutation(internal.skillsShMirror.reconcileBatchInternal, {
+      runId: foundation.runId,
+      limit: 250,
+    });
+
+    const apply = async (snapshotId: string, observedAt: string, rank: number) => {
+      const { runId } = await startRun(t, snapshotId, 1, undefined, "trending", observedAt);
+      const leaseToken = await claimLease(t, runId, 0, 0);
+      return await t.mutation(trendingRefs.processTrendingBatchInternal, {
+        runId,
+        page: 0,
+        offset: 0,
+        leaseToken,
+        pageLength: 1,
+        hasMore: false,
+        sourceTotal: 1,
+        rows: [{ externalId: githubRow.externalId, lifetimeInstalls: 17, rank }],
+      });
+    };
+
+    await expect(
+      apply("skills-sh:trending:new", "2026-07-22T20:14:10.881Z", 1),
+    ).resolves.toMatchObject({ counts: { trendingUpdated: 1 } });
+    await expect(
+      apply("skills-sh:trending:replay", "2026-07-22T20:14:10.881Z", 1),
+    ).resolves.toMatchObject({ counts: { trendingUnchanged: 1, trendingUpdated: 0 } });
+    await expect(
+      apply("skills-sh:trending:stale", "2026-07-21T20:14:10.881Z", 1),
+    ).resolves.toMatchObject({ counts: { trendingStaleRejected: 1, trendingUpdated: 0 } });
+    await expect(
+      t.query(internal.skillsShMirror.getByExternalIdInternal, {
+        externalId: githubRow.externalId,
+      }),
+    ).resolves.toMatchObject({
+      trendingRank: 1,
+      trendingLifetimeInstalls: 17,
+      trendingObservedAt: Date.parse("2026-07-22T20:14:10.881Z"),
+    });
+  });
+
+  it("hydrates bounded trending drift through the mirror upsert path", async () => {
+    useTestEnvironment();
+    const t = convexTest(schema, modules);
+    await configure(t);
+    const trending = await startRun(t, "skills-sh:trending:drift", 1, undefined, "trending");
+    const leaseToken = await claimLease(t, trending.runId, 0, 0);
+
+    await expect(
+      t.mutation(trendingRefs.hydrateTrendingBatchInternal, {
+        runId: trending.runId,
+        page: 0,
+        offset: 0,
+        leaseToken,
+        rows: [githubRow],
+      }),
+    ).resolves.toMatchObject({
+      counts: { trendingHydrationAttempts: 1, trendingHydrated: 1 },
+    });
+    await expect(
+      t.mutation(trendingRefs.processTrendingBatchInternal, {
+        runId: trending.runId,
+        page: 0,
+        offset: 0,
+        leaseToken,
+        pageLength: 1,
+        hasMore: false,
+        sourceTotal: 1,
+        rows: [{ externalId: githubRow.externalId, lifetimeInstalls: 17, rank: 1 }],
+      }),
+    ).resolves.toMatchObject({
+      status: "completed",
+      counts: { trendingJoined: 1, trendingMissing: 0 },
+    });
+    expect(
+      await t.run(async (ctx) => await ctx.db.query("skillsShMirrorDigests").collect()),
+    ).toHaveLength(1);
+  });
+
+  it("fails closed when exceptional trending hydration exceeds the run bound", async () => {
+    useTestEnvironment();
+    const t = convexTest(schema, modules);
+    await configure(t);
+    const trending = await startRun(
+      t,
+      "skills-sh:trending:bounded-drift",
+      51,
+      undefined,
+      "trending",
+    );
+    const leaseToken = await claimLease(t, trending.runId, 0, 0);
+    const rows = Array.from({ length: 50 }, (_, index) => ({
+      ...githubRow,
+      externalId: `owner/repo/skill-${index}`,
+    }));
+
+    await expect(
+      t.mutation(trendingRefs.hydrateTrendingBatchInternal, {
+        runId: trending.runId,
+        page: 0,
+        offset: 0,
+        leaseToken,
+        rows,
+      }),
+    ).resolves.toMatchObject({ counts: { trendingHydrationAttempts: 50 } });
+    await expect(
+      t.mutation(mirrorLeaseRefs.claimBatchLeaseInternal, {
+        runId: trending.runId,
+        page: 0,
+        offset: 0,
+        leaseToken,
+      }),
+    ).resolves.toMatchObject({ trendingHydrationAttempts: 50 });
+
+    await expect(
+      t.mutation(trendingRefs.hydrateTrendingBatchInternal, {
+        runId: trending.runId,
+        page: 0,
+        offset: 0,
+        leaseToken,
+        rows: [{ ...githubRow, externalId: "owner/repo/skill-50" }],
+      }),
+    ).rejects.toThrow("exceptional hydration exceeds 50 rows");
+    const conflicts = await t.run(async (ctx) => ctx.db.query("skillsShMirrorConflicts").collect());
+    expect(conflicts).toHaveLength(50);
+    expect(conflicts.some((conflict) => conflict.externalId === "owner/repo/skill-50")).toBe(false);
+  });
+
+  it("separates known normalizer conflicts from hydratable trending drift", async () => {
+    useTestEnvironment();
+    const t = convexTest(schema, modules);
+    await configure(t);
+    const foundation = await startRun(t, "skills-sh:proof:known-quarantine", 1, "a".repeat(64));
+    const quarantinedExternalId = "owner/repo/known-quarantine";
+    const unseenExternalId = "owner/repo/unseen";
+    await t.run(async (ctx) => {
+      await ctx.db.insert("skillsShMirrorConflicts", {
+        runId: foundation.runId,
+        externalId: quarantinedExternalId,
+        kind: "source-quarantine",
+        reason: "unsupported-source-type",
+        observedFingerprint: "known-quarantine",
+        page: 0,
+        offset: 0,
+        createdAt: Date.now(),
+      });
+    });
+    await completeLeaderboardRun(t, foundation.runId, {
+      legacy: true,
+      completedAt: Date.now(),
+    });
+
+    await expect(
+      t.query(internal.skillsShMirror.getTrendingJoinStateInternal, {
+        externalIds: [quarantinedExternalId, unseenExternalId],
+      }),
+    ).resolves.toEqual({
+      joinedExternalIds: [],
+      missingExternalIds: [quarantinedExternalId, unseenExternalId],
+      knownConflictExternalIds: [quarantinedExternalId],
+      hydratableExternalIds: [unseenExternalId],
+    });
+  });
+
+  it("keeps completed leaderboard quarantine authoritative over later replay and capture", async () => {
+    useTestEnvironment();
+    const t = convexTest(schema, modules);
+    await configure(t);
+    const externalId = "owner/repo/known-quarantine";
+    const foundation = await startRun(
+      t,
+      "skills-sh:proof:authoritative-leaderboard",
+      1,
+      "a".repeat(64),
+      "leaderboard",
+    );
+    await t.run(async (ctx) => {
+      await ctx.db.insert("skillsShMirrorConflicts", {
+        runId: foundation.runId,
+        externalId,
+        kind: "source-quarantine",
+        reason: "unsupported-source-type",
+        observedFingerprint: "known-quarantine",
+        page: 0,
+        offset: 0,
+        createdAt: 1,
+      });
+    });
+    await completeLeaderboardRun(t, foundation.runId, { startedAt: 1, completedAt: 2 });
+    const replay = await startRun(
+      t,
+      "skills-sh:proof:captured-replay",
+      1,
+      undefined,
+      "leaderboard",
+    );
+    await t.run(async (ctx) => {
+      await ctx.db.patch(replay.runId, {
+        status: "completed",
+        startedAt: 3,
+        completedAt: 4,
+      });
+    });
+    await startRun(
+      t,
+      "skills-sh:proof:unfinished-capture",
+      1,
+      "b".repeat(64),
+      "leaderboard",
+      "2026-07-22T20:14:11.881Z",
+    );
+    await t.run(async (ctx) => {
+      const control = (await ctx.db.query("skillsShMirrorControls").collect())[0];
+      if (!control) throw new Error("mirror control missing");
+      const sourcePage = (await ctx.db.query("skillsShMirrorSourcePages").collect()).find(
+        (page) => page.snapshotHash === "a".repeat(64) && page.page === 0,
+      );
+      if (!sourcePage) throw new Error("leaderboard source page missing");
+      await ctx.db.patch(sourcePage._id, { sourceView: undefined });
+      await ctx.db.patch(control._id, { latestCompletedLeaderboardRunId: replay.runId });
+    });
+    await configure(t);
+
+    await expect(
+      t.query(internal.skillsShMirror.getTrendingJoinStateInternal, { externalIds: [externalId] }),
+    ).resolves.toEqual({
+      joinedExternalIds: [],
+      missingExternalIds: [externalId],
+      knownConflictExternalIds: [externalId],
+      hydratableExternalIds: [],
+    });
+  });
+
+  it("keeps stale normalizer conflicts eligible for bounded trending hydration", async () => {
+    useTestEnvironment();
+    const t = convexTest(schema, modules);
+    await configure(t);
+    const externalId = "owner/repo/recovered-upstream";
+    const oldFoundation = await startRun(t, "skills-sh:proof:old-quarantine", 1, "a".repeat(64));
+    await t.run(async (ctx) => {
+      await ctx.db.insert("skillsShMirrorConflicts", {
+        runId: oldFoundation.runId,
+        externalId,
+        kind: "source-quarantine",
+        reason: "unsupported-source-type",
+        observedFingerprint: "old-quarantine",
+        page: 0,
+        offset: 0,
+        createdAt: Date.now() - 1,
+      });
+    });
+    await completeLeaderboardRun(t, oldFoundation.runId, {
+      legacy: true,
+      completedAt: Date.now() - 1,
+    });
+    const currentFoundation = await startRun(
+      t,
+      "skills-sh:proof:current-source",
+      1,
+      "b".repeat(64),
+      "leaderboard",
+      "2026-07-22T20:14:11.881Z",
+    );
+    await completeLeaderboardRun(t, currentFoundation.runId, { completedAt: Date.now() });
+
+    await expect(
+      t.query(internal.skillsShMirror.getTrendingJoinStateInternal, { externalIds: [externalId] }),
+    ).resolves.toEqual({
+      joinedExternalIds: [],
+      missingExternalIds: [externalId],
+      knownConflictExternalIds: [],
+      hydratableExternalIds: [externalId],
+    });
+  });
+
+  it("does not let a later unrelated conflict mask the current leaderboard quarantine", async () => {
+    useTestEnvironment();
+    const t = convexTest(schema, modules);
+    await configure(t);
+    const externalId = "owner/repo/current-quarantine";
+    const foundation = await startRun(t, "skills-sh:proof:current-quarantine", 1, "a".repeat(64));
+    await t.run(async (ctx) => {
+      await ctx.db.insert("skillsShMirrorConflicts", {
+        runId: foundation.runId,
+        externalId,
+        kind: "source-quarantine",
+        reason: "unsupported-source-type",
+        observedFingerprint: "current-quarantine",
+        page: 0,
+        offset: 0,
+        createdAt: Date.now() - 1,
+      });
+    });
+    await completeLeaderboardRun(t, foundation.runId, {
+      legacy: true,
+      completedAt: Date.now() - 1,
+    });
+    const trending = await startRun(
+      t,
+      "skills-sh:trending:later-conflict",
+      1,
+      undefined,
+      "trending",
+    );
+    await t.run(async (ctx) => {
+      await ctx.db.insert("skillsShMirrorConflicts", {
+        runId: trending.runId,
+        externalId,
+        kind: "source-quarantine",
+        reason: "later-unrelated-quarantine",
+        observedFingerprint: "later-unrelated-conflict",
+        page: 0,
+        offset: 0,
+        createdAt: Date.now(),
+      });
+    });
+
+    await expect(
+      t.query(internal.skillsShMirror.getTrendingJoinStateInternal, { externalIds: [externalId] }),
+    ).resolves.toEqual({
+      joinedExternalIds: [],
+      missingExternalIds: [externalId],
+      knownConflictExternalIds: [externalId],
+      hydratableExternalIds: [],
+    });
   });
 
   it("returns the durable cursor summary when starting a run", async () => {
@@ -290,6 +763,7 @@ describe("skills.sh external mirror", () => {
       t.query(internal.skillsShMirror.getSourceCaptureSummaryInternal, { snapshotHash }),
     ).resolves.toEqual({
       snapshotHash,
+      sourceView: "leaderboard",
       pageDocuments: 1,
       rows: 1,
       sourceBytes: 512,

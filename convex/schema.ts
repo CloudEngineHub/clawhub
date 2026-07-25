@@ -3115,6 +3115,7 @@ const skillsShMirrorControls = defineTable({
   maxRowsPerRun: v.number(),
   maxRowsPerBatch: v.number(),
   maxDetailBytes: v.number(),
+  latestCompletedLeaderboardRunId: v.optional(v.id("skillsShMirrorRuns")),
   updatedBy: v.string(),
   reason: v.string(),
   updatedAt: v.number(),
@@ -3136,12 +3137,21 @@ const skillsShMirrorRunCountsValidator = v.object({
   detailsTruncated: v.number(),
   tombstoned: v.number(),
   reactivated: v.number(),
+  trendingJoined: v.optional(v.number()),
+  trendingUpdated: v.optional(v.number()),
+  trendingUnchanged: v.optional(v.number()),
+  trendingMissing: v.optional(v.number()),
+  trendingStaleRejected: v.optional(v.number()),
+  trendingHydrationAttempts: v.optional(v.number()),
+  trendingHydrated: v.optional(v.number()),
+  trendingHydrationFailed: v.optional(v.number()),
   scansPlanned: v.literal(0),
   scansAdmitted: v.literal(0),
 });
 
 const skillsShMirrorRuns = defineTable({
   snapshotId: v.string(),
+  sourceView: v.optional(v.union(v.literal("leaderboard"), v.literal("trending"))),
   sourceSnapshotHash: v.optional(v.string()),
   sourceCaptureWrites: v.optional(v.number()),
   status: v.union(
@@ -3155,6 +3165,7 @@ const skillsShMirrorRuns = defineTable({
   sourceTotal: v.number(),
   sourcePageSize: v.number(),
   sourceMeasuredAt: v.string(),
+  sourceDurationMs: v.optional(v.number()),
   page: v.number(),
   offset: v.number(),
   batchLeaseToken: v.optional(v.string()),
@@ -3175,12 +3186,18 @@ const skillsShMirrorRuns = defineTable({
   updatedAt: v.number(),
 })
   .index("by_started_at", ["startedAt"])
+  .index("by_source_view_and_status_and_source_snapshot_hash", [
+    "sourceView",
+    "status",
+    "sourceSnapshotHash",
+  ])
   .index("by_status_and_updated_at", {
     fields: ["status", "updatedAt"],
   });
 
 const skillsShMirrorSourcePages = defineTable({
   snapshotHash: v.string(),
+  sourceView: v.optional(v.union(v.literal("leaderboard"), v.literal("trending"))),
   page: v.number(),
   sourceTotal: v.number(),
   pageLength: v.number(),
@@ -3202,7 +3219,9 @@ const skillsShMirrorSourcePages = defineTable({
     }),
   ),
   createdAt: v.number(),
-}).index("by_snapshot_hash_and_page", ["snapshotHash", "page"]);
+})
+  .index("by_snapshot_hash_and_page", ["snapshotHash", "page"])
+  .index("by_source_view_and_page_and_created_at", ["sourceView", "page", "createdAt"]);
 
 const skillsShMirrorUpstreamScannerValidator = v.object({
   status: v.string(),
@@ -3236,6 +3255,11 @@ const skillsShMirrorDigests = defineTable({
   githubCommit: v.optional(v.string()),
   sourceContentHash: v.optional(v.string()),
   upstreamInstalls: v.number(),
+  trendingRank: v.optional(v.number()),
+  trendingLifetimeInstalls: v.optional(v.number()),
+  trendingObservedAt: v.optional(v.number()),
+  trendingSnapshotId: v.optional(v.string()),
+  trendingObservedRunId: v.optional(v.id("skillsShMirrorRuns")),
   upstreamScanners: v.object({
     genAgentTrustHub: skillsShMirrorUpstreamScannerValidator,
     socket: skillsShMirrorUpstreamScannerValidator,
@@ -3340,6 +3364,7 @@ const skillsShMirrorConflicts = defineTable({
   externalId: v.string(),
   kind: v.union(
     v.literal("same-run-drift"),
+    v.literal("trending-same-observation-drift"),
     v.literal("identity-mismatch"),
     v.literal("source-quarantine"),
   ),
@@ -3354,6 +3379,9 @@ const skillsShMirrorConflicts = defineTable({
   .index("by_run_id", ["runId"])
   .index("by_external_id_and_created_at", {
     fields: ["externalId", "createdAt"],
+  })
+  .index("by_run_id_and_external_id_and_kind", {
+    fields: ["runId", "externalId", "kind"],
   });
 
 const publisherAbuseScoreRuns = defineTable({
