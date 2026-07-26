@@ -1172,6 +1172,22 @@ describe("devSeed local fixtures", () => {
 
   it("seeds moderation and plugin fixtures for an explicit local user with scoped identifiers", async () => {
     const { db, tables } = createDb();
+    const staleProofPublisherId = (await db.insert("publishers", {
+      handle: "patrick-erichsen",
+      kind: "user",
+      displayName: "Patrick Erichsen",
+    })) as Id<"publishers">;
+    const staleProofSkillId = (await db.insert("skills", {
+      ownerPublisherId: staleProofPublisherId,
+      slug: "test",
+      summary:
+        "CLAW-526 Clean Preview Skill validates staged publishing through the hosted ClawHub Test UI.",
+      moderationStatus: "active",
+    })) as Id<"skills">;
+    await db.insert("skillSearchDigest", {
+      skillId: staleProofSkillId,
+      moderationStatus: "active",
+    });
     const userId = (await db.insert("users", {
       handle: "fuller-stack-dev",
       displayName: "Fuller Stack Dev",
@@ -1200,6 +1216,13 @@ describe("devSeed local fixtures", () => {
         flaggedPluginReadme: "# Flagged plugin",
         scannedPluginStorageId: "storage:scanned-plugin",
         scannedPluginReadme: "# Scanned plugin",
+        excludeFromPublicCatalog: true,
+        staleProofSkill: {
+          ownerHandle: "patrick-erichsen",
+          slug: "test",
+          summary:
+            "CLAW-526 Clean Preview Skill validates staged publishing through the hosted ClawHub Test UI.",
+        },
       } as never,
     );
     const reseedResult = (await seedLocalModerationFixturesHandler(
@@ -1235,6 +1258,22 @@ describe("devSeed local fixtures", () => {
     };
     expect(fixtureStorageId(flaggedSkillSlug)).toBe("storage:skill-next");
     expect(fixtureStorageId(scannedSkillSlug)).toBe("storage:scanned-skill-next");
+    expect(
+      tables.skills
+        ?.filter((skill) =>
+          [scannedSkillSlug, "local-truncation-plugin-runtime-integration-skill"].includes(
+            String(skill.slug),
+          ),
+        )
+        .every((skill) => skill.moderationStatus === "hidden"),
+    ).toBe(true);
+    expect(tables.skills?.find((skill) => skill._id === staleProofSkillId)).toMatchObject({
+      moderationStatus: "hidden",
+      moderationReason: "test.fixture",
+    });
+    expect(
+      tables.skillSearchDigest?.find((digest) => digest.skillId === staleProofSkillId),
+    ).toMatchObject({ moderationStatus: "hidden", moderationReason: "test.fixture" });
     const deduplicatedReseedResult = (await seedLocalModerationFixturesHandler(
       createMutationCtx(db) as never,
       {
@@ -1280,14 +1319,15 @@ describe("devSeed local fixtures", () => {
 
     expect(tables.users).toHaveLength(1);
     expect(tables.users?.[0]).toEqual(expect.objectContaining({ handle: "fuller-stack-dev" }));
+    const seededSkills = tables.skills?.filter((skill) => skill._id !== staleProofSkillId);
     expect(
-      tables.skills?.map((skill) => String(skill.slug)).sort((a, b) => a.localeCompare(b)),
+      seededSkills?.map((skill) => String(skill.slug)).sort((a, b) => a.localeCompare(b)),
     ).toEqual([
       scannedSkillSlug,
       flaggedSkillSlug,
       "local-truncation-plugin-runtime-integration-skill",
     ]);
-    expect(tables.skills?.every((skill) => skill.ownerUserId === userId)).toBe(true);
+    expect(seededSkills?.every((skill) => skill.ownerUserId === userId)).toBe(true);
     expect(
       tables.packages?.map((pkg) => String(pkg.name)).sort((a, b) => a.localeCompare(b)),
     ).toEqual([
