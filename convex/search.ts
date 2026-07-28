@@ -308,6 +308,7 @@ function prefixUpperBound(value: string) {
 const skillSearchArgs = {
   query: v.string(),
   limit: v.optional(v.number()),
+  mode: v.optional(v.literal("exact")),
   highlightedOnly: v.optional(v.boolean()),
   nonSuspiciousOnly: v.optional(v.boolean()),
   excludePendingScan: v.optional(v.boolean()),
@@ -318,6 +319,7 @@ const skillSearchArgs = {
 type SkillSearchArgs = {
   query: string;
   limit?: number;
+  mode?: "exact";
   highlightedOnly?: boolean;
   nonSuspiciousOnly?: boolean;
   excludePendingScan?: boolean;
@@ -335,6 +337,33 @@ const nativeSkillSearch = {
     if (args.topic !== undefined && !topic) return [];
     const queryTokens = tokenize(query);
     if (queryTokens.length === 0) return [];
+    if (args.mode === "exact") {
+      const exactLimit = Math.min(
+        Math.max(Math.trunc(args.limit ?? 10), 1),
+        MAX_EXACT_SLUG_MATCHES,
+      );
+      const exactSlugMatches = isSlugLikeQuery(query.toLowerCase())
+        ? ((await ctx.runQuery(internal.search.getExactSkillSlugMatch, {
+            slug: query.toLowerCase(),
+            nonSuspiciousOnly: args.nonSuspiciousOnly,
+            categorySlug,
+            topic,
+          })) as SkillSearchEntry[])
+        : [];
+      return exactSlugMatches
+        .filter(
+          (entry) =>
+            (!args.highlightedOnly || isSkillHighlighted(entry.skill)) &&
+            (!args.excludePendingScan || entry.skill.githubScanStatus !== "pending"),
+        )
+        .sort(compareSkillTrust)
+        .slice(0, exactLimit)
+        .map((entry) => ({
+          ...entry,
+          score: EXACT_SLUG_BOOST,
+          semanticScore: 0,
+        }));
+    }
     const rawExactSlugMatches = isSlugLikeQuery(query)
       ? ((await ctx.runQuery(internal.search.getExactSkillSlugMatch, {
           slug: query.toLowerCase(),
@@ -854,6 +883,9 @@ export const searchSkills: ReturnType<typeof action> = action({
       .filter(
         (result): result is CanonicalSkillSearchResult & CanonicalSkillSearchCandidate =>
           result !== null,
+      )
+      .filter(
+        (result) => args.mode !== "exact" || result.slug.toLowerCase() === query.toLowerCase(),
       )
       .sort(compareCanonicalSkillSearchCandidates)
       .slice(0, limit);

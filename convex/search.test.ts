@@ -324,6 +324,37 @@ describe("search helpers", () => {
     );
   });
 
+  it("exact mode bypasses vector and fallback recall", async () => {
+    const exactEntry = {
+      skill: makePublicSkill({
+        id: "skills:exact",
+        slug: "exact-skill",
+        displayName: "Exact Skill",
+      }),
+      version: null,
+      ownerHandle: "owner",
+      owner: null,
+    };
+    const runQuery = vi.fn().mockResolvedValueOnce([exactEntry]);
+    const vectorSearch = vi.fn();
+
+    const result = await searchSkillsHandler(
+      {
+        vectorSearch,
+        runQuery,
+      },
+      { query: "exact-skill", mode: "exact", limit: 10 },
+    );
+
+    expect(result.map((entry) => entry.skill.slug)).toEqual(["exact-skill"]);
+    expect(vectorSearch).not.toHaveBeenCalled();
+    expect(runQuery).toHaveBeenCalledOnce();
+    expect(runQuery).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ slug: "exact-skill" }),
+    );
+  });
+
   it("recalls non-first-token slug matches via the full-text search index (Bug 1)", async () => {
     // Repro of the original bug: searching "yijian" against a skill whose
     // slug is "baidu-yijian-vision" returned zero results because all four
@@ -1296,6 +1327,45 @@ describe("search helpers", () => {
       icon: null,
       sourceIdentity: { lifetimeInstalls: 10_000_000 },
     });
+  });
+
+  it("keeps exact mode deterministic across canonical sources", async () => {
+    const native = {
+      skill: makePublicSkill({
+        id: "skills:calendar",
+        slug: "calendar",
+        displayName: "Calendar",
+      }),
+      version: null,
+      ownerHandle: "openclaw",
+      owner: null,
+    };
+    const exactExternal = makeExternalSearchDigest({ externalId: "acme/skills/calendar" });
+    const prefixExternal = makeExternalSearchDigest({
+      externalId: "acme/skills/calendar-tools",
+    });
+    const runQuery = vi.fn(async (ref: Parameters<typeof getFunctionName>[0]) => {
+      switch (getFunctionName(ref)) {
+        case "search:getExactSkillSlugMatch":
+          return [native];
+        case "search:getExternalSkillSearchCandidates":
+          return [exactExternal, prefixExternal];
+        case "search:getRollingSkillSearchUsage":
+          return [{ skillId: native.skill._id, installs: 12, bookmarks: 3 }];
+        default:
+          throw new Error(`Unexpected query ${getFunctionName(ref)}`);
+      }
+    });
+
+    const result = await canonicalSearchSkillsHandler(
+      { runQuery, vectorSearch: vi.fn() },
+      { query: "calendar", mode: "exact", limit: 10 },
+    );
+
+    expect(result.map((row) => `${String(row.source)}:${String(row.slug)}`)).toEqual([
+      "clawhub:calendar",
+      "skills-sh:calendar",
+    ]);
   });
 
   it("excludes pending owner-qualified matches when pending scans are disabled", async () => {

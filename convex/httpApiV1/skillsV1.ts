@@ -52,6 +52,7 @@ import {
   getSkillFileModerationInfoFromSkill,
   isSkillVersionForSkill,
 } from "../lib/skillFileAccess";
+import { normalizeSkillSlug } from "../lib/skillSlugValidator";
 import {
   buildDeterministicZip,
   buildMergedExportZip,
@@ -1346,17 +1347,22 @@ export async function searchSkillsV1Handler(ctx: ActionCtx, request: Request) {
   const url = new URL(request.url);
   const query = url.searchParams.get("q")?.trim() ?? "";
   const limit = toOptionalNumber(url.searchParams.get("limit"));
+  const rawMode = url.searchParams.get("mode")?.trim().toLowerCase();
   const highlightedOnly = parseBooleanQueryParam(url.searchParams.get("highlightedOnly"));
   const nonSuspiciousOnly = resolveBooleanQueryParam(
     url.searchParams.get("nonSuspiciousOnly"),
     url.searchParams.get("nonSuspicious"),
   );
 
+  if (rawMode && rawMode !== "exact") {
+    return text("Invalid search mode", 400, rate.headers);
+  }
   if (!query) return json({ results: [] }, 200, rate.headers);
 
   const results = (await ctx.runAction(api.search.searchSkills, {
     query,
     limit,
+    ...(rawMode ? { mode: "exact" as const } : {}),
     highlightedOnly: highlightedOnly || undefined,
     nonSuspiciousOnly: nonSuspiciousOnly || undefined,
   })) as unknown[];
@@ -1398,9 +1404,16 @@ export async function resolveSkillVersionV1Handler(ctx: ActionCtx, request: Requ
   );
 }
 
-type SkillListSort = "recommended" | "createdAt" | "updated" | "downloads" | "stars" | "trending";
+type SkillListSort =
+  | "recommended"
+  | "createdAt"
+  | "updated"
+  | "downloads"
+  | "stars"
+  | "name"
+  | "trending";
 
-type PublicListSort = "recommended" | "newest" | "updated" | "downloads" | "stars";
+type PublicListSort = "recommended" | "newest" | "updated" | "downloads" | "stars" | "name";
 
 function parseListSort(value: string | null): SkillListSort | null {
   if (value === null) return "updated";
@@ -1413,6 +1426,7 @@ function parseListSort(value: string | null): SkillListSort | null {
   }
   if (normalized === "downloads") return "downloads";
   if (normalized === "stars" || normalized === "rating") return "stars";
+  if (normalized === "name") return "name";
   if (
     normalized === "installs" ||
     normalized === "install" ||
@@ -1441,6 +1455,8 @@ function toPublicListSort(sort: Exclude<SkillListSort, "trending">): PublicListS
       return "downloads";
     case "stars":
       return "stars";
+    case "name":
+      return "name";
   }
   throw new Error("Unhandled skill list sort");
 }
@@ -1452,8 +1468,20 @@ export async function listSkillsV1Handler(ctx: ActionCtx, request: Request) {
   const url = new URL(request.url);
   const limit = toOptionalNumber(url.searchParams.get("limit"));
   const rawCursor = url.searchParams.get("cursor")?.trim() || undefined;
-  const sort = parseListSort(url.searchParams.get("sort"));
+  const rawPrefix = url.searchParams.get("prefix");
+  const prefix = rawPrefix === null ? undefined : normalizeSkillSlug(rawPrefix);
+  if (
+    rawPrefix !== null &&
+    (!prefix || prefix.length > 96 || !/^[a-z0-9][a-z0-9-]*$/.test(prefix))
+  ) {
+    return text("Invalid prefix query parameter", 400, rate.headers);
+  }
+  const requestedSort = parseListSort(url.searchParams.get("sort"));
+  const sort = prefix && url.searchParams.get("sort") === null ? "name" : requestedSort;
   if (!sort) return text("Invalid sort query parameter", 400, rate.headers);
+  if (prefix && sort !== "name") {
+    return text("Prefix listing only supports name sort", 400, rate.headers);
+  }
   const cursor = sort === "trending" ? undefined : rawCursor;
   const nonSuspiciousOnly = resolveBooleanQueryParam(
     url.searchParams.get("nonSuspiciousOnly"),
@@ -1471,6 +1499,7 @@ export async function listSkillsV1Handler(ctx: ActionCtx, request: Request) {
       cursor,
       numItems: limit,
       sort: toPublicListSort(sort),
+      ...(prefix ? { dir: "asc" as const, prefix } : {}),
       nonSuspiciousOnly: nonSuspiciousOnly || undefined,
     })) as {
       items?: ListSkillsResult["items"];

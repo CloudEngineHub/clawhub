@@ -74,6 +74,13 @@ type SkillReportTriageOptions = {
   yes?: boolean;
 };
 
+type SkillSearchOptions = {
+  limit?: number;
+  prefix?: boolean;
+  exact?: boolean;
+  cursor?: string;
+};
+
 type SkillRef = {
   slug: string;
   ownerHandle?: string;
@@ -299,17 +306,50 @@ function formatSearchOwner(entry: {
   return entry.publisher?.displayName ?? entry.owner?.displayName ?? "unknown owner";
 }
 
-export async function cmdSearch(opts: GlobalOpts, query: string, limit?: number) {
+export async function cmdSearch(
+  opts: GlobalOpts,
+  query: string,
+  options: number | SkillSearchOptions = {},
+) {
   if (!query) fail("Query required");
+  const searchOptions = typeof options === "number" ? { limit: options } : options;
+  if (searchOptions.prefix && searchOptions.exact) {
+    fail("Choose either --prefix or --exact, not both");
+  }
+  if (searchOptions.cursor && !searchOptions.prefix) {
+    fail("--cursor requires --prefix");
+  }
 
   const token = await getOptionalAuthToken();
   const registry = await getRegistry(opts, { cache: true });
   const spinner = createCrabLoader("Searching");
   try {
+    const effectiveLimit =
+      typeof searchOptions.limit === "number" && Number.isFinite(searchOptions.limit)
+        ? searchOptions.limit
+        : 25;
+    if (searchOptions.prefix) {
+      const url = registryUrl(ApiRoutes.skills, registry);
+      url.searchParams.set("prefix", query);
+      url.searchParams.set("limit", String(effectiveLimit));
+      if (searchOptions.cursor?.trim()) url.searchParams.set("cursor", searchOptions.cursor.trim());
+      const result = await apiRequest(
+        registry,
+        { method: "GET", url: url.toString(), token },
+        ApiV1SkillListResponseSchema,
+      );
+
+      spinner.stop();
+      if (result.items.length === 0) console.log("No skills found.");
+      for (const item of result.items) console.log(formatExploreLine(item));
+      if (result.nextCursor) console.log(`Next cursor: ${result.nextCursor}`);
+      return;
+    }
+
     const url = registryUrl(ApiRoutes.search, registry);
     url.searchParams.set("q", query);
-    const effectiveLimit = typeof limit === "number" && Number.isFinite(limit) ? limit : 25;
     url.searchParams.set("limit", String(effectiveLimit));
+    if (searchOptions.exact) url.searchParams.set("mode", "exact");
     const result = await apiRequest(
       registry,
       { method: "GET", url: url.toString(), token },

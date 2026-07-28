@@ -33,6 +33,7 @@ type WrappedHandler<TArgs, TResult> = {
 type PublicListArgs = {
   cursor?: string;
   numItems?: number;
+  prefix?: string;
   sort?:
     | "default"
     | "recommended"
@@ -789,6 +790,77 @@ describe("public skill list deterministic cursors", () => {
       index: "by_active_updated",
       startIndexKey: [undefined, 200, 201, "skillSearchDigest:alpha"],
       startInclusive: false,
+    });
+  });
+
+  it("paginates a slug prefix through the normalized-slug index", async () => {
+    getPageMock
+      .mockResolvedValueOnce({
+        page: [],
+        hasMore: true,
+        indexKeys: [[undefined, "aigroup-alpha", 200, "skillSearchDigest:alpha"]],
+      })
+      .mockResolvedValueOnce({
+        page: [],
+        hasMore: false,
+        indexKeys: [[undefined, "aigroup-beta", 300, "skillSearchDigest:beta"]],
+      });
+
+    const first = await listPublicApiPageV1Handler({} as never, {
+      prefix: "aigroup-",
+      numItems: 1,
+    });
+
+    expect(getPageMock.mock.calls[0]?.[1]).toMatchObject({
+      index: "by_active_normalized_slug",
+      startIndexKey: [undefined, "aigroup-"],
+      startInclusive: true,
+      endIndexKey: [undefined, "aigroup-\uffff"],
+      endInclusive: false,
+      order: "asc",
+    });
+    expect(first.nextCursor).not.toBeNull();
+
+    const second = await listPublicApiPageV1Handler({} as never, {
+      prefix: "aigroup-",
+      cursor: first.nextCursor!,
+      numItems: 1,
+    });
+
+    expect(getPageMock.mock.calls[1]?.[1]).toMatchObject({
+      index: "by_active_normalized_slug",
+      startIndexKey: [undefined, "aigroup-alpha", 200, "skillSearchDigest:alpha"],
+      startInclusive: false,
+    });
+    expect(second.nextCursor).toBeNull();
+  });
+
+  it("does not reuse a prefix cursor for a different prefix", async () => {
+    getPageMock.mockResolvedValueOnce({
+      page: [],
+      hasMore: false,
+      indexKeys: [],
+    });
+    const cursor = `skillprefix:${JSON.stringify({
+      prefix: "aigroup-",
+      cursor: cursorForIndex("by_active_normalized_slug", [
+        { __undef: 1 },
+        "aigroup-alpha",
+        200,
+        "skillSearchDigest:alpha",
+      ]),
+    })}`;
+
+    await listPublicApiPageV1Handler({} as never, {
+      prefix: "ai",
+      cursor,
+      numItems: 1,
+    });
+
+    expect(getPageMock.mock.calls[0]?.[1]).toMatchObject({
+      index: "by_active_normalized_slug",
+      startIndexKey: [undefined, "ai"],
+      startInclusive: true,
     });
   });
 

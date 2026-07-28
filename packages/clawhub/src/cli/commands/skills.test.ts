@@ -326,6 +326,49 @@ describe("cmdSearch", () => {
     expect(url.searchParams.get("limit")).toBe("5");
   });
 
+  it("routes prefix search through the paginated skills list", async () => {
+    mockGetOptionalAuthToken.mockResolvedValue(undefined);
+    mockApiRequest.mockResolvedValue({ items: [], nextCursor: "cursor-2" });
+
+    await cmdSearch(makeOpts(), "aigroup-", { prefix: true, limit: 10, cursor: "cursor-1" });
+
+    const [, requestArgs] = mockApiRequest.mock.calls[0] ?? [];
+    const url = new URL(String(requestArgs?.url));
+    expect(url.pathname).toBe(ApiRoutes.skills);
+    expect(url.searchParams.get("prefix")).toBe("aigroup-");
+    expect(url.searchParams.get("limit")).toBe("10");
+    expect(url.searchParams.get("cursor")).toBe("cursor-1");
+    expect(url.searchParams.has("mode")).toBe(false);
+    expect(mockLog).toHaveBeenCalledWith("Next cursor: cursor-2");
+  });
+
+  it("sets exact search mode", async () => {
+    mockGetOptionalAuthToken.mockResolvedValue(undefined);
+    mockApiRequest.mockResolvedValue({ results: [] });
+
+    await cmdSearch(makeOpts(), "aigroup-alpha", { exact: true });
+
+    const [, requestArgs] = mockApiRequest.mock.calls[0] ?? [];
+    const url = new URL(String(requestArgs?.url));
+    expect(url.searchParams.get("q")).toBe("aigroup-alpha");
+    expect(url.searchParams.get("limit")).toBe("25");
+    expect(url.searchParams.get("mode")).toBe("exact");
+  });
+
+  it("rejects conflicting search modes", async () => {
+    await expect(cmdSearch(makeOpts(), "aigroup-", { prefix: true, exact: true })).rejects.toThrow(
+      "Choose either --prefix or --exact, not both",
+    );
+    expect(mockApiRequest).not.toHaveBeenCalled();
+  });
+
+  it("rejects a cursor without prefix mode", async () => {
+    await expect(cmdSearch(makeOpts(), "demo", { cursor: "cursor-1" })).rejects.toThrow(
+      "--cursor requires --prefix",
+    );
+    expect(mockApiRequest).not.toHaveBeenCalled();
+  });
+
   it("prints skill owners in search results", async () => {
     mockGetOptionalAuthToken.mockResolvedValue(undefined);
     mockApiRequest.mockResolvedValue({

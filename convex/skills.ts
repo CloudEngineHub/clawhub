@@ -5273,6 +5273,7 @@ const NONSUSPICIOUS_SORT_INDEX_FIELD_COUNTS: Record<PublicListSort, number> = {
   installs: 4,
 };
 const GET_PAGE_TIEBREAKER_FIELD_COUNT = 2;
+const PUBLIC_API_PREFIX_CURSOR_PREFIX = "skillprefix:";
 
 function encodeIndexKeyValue(val: Value | undefined): Value {
   return val === undefined ? { __undef: 1 } : val;
@@ -5291,6 +5292,31 @@ function encodeIndexKey(indexName: string, key: IndexKey): string {
     index: indexName,
     key: key.map(encodeIndexKeyValue),
   });
+}
+
+function encodePublicApiPrefixCursor(prefix: string, indexName: string, key: IndexKey) {
+  return `${PUBLIC_API_PREFIX_CURSOR_PREFIX}${JSON.stringify({
+    prefix,
+    cursor: encodeIndexKey(indexName, key),
+  })}`;
+}
+
+function decodePublicApiPrefixCursor(cursor: string | undefined, prefix: string) {
+  if (!cursor?.startsWith(PUBLIC_API_PREFIX_CURSOR_PREFIX)) return undefined;
+  try {
+    const parsed = JSON.parse(cursor.slice(PUBLIC_API_PREFIX_CURSOR_PREFIX.length)) as unknown;
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      (parsed as { prefix?: unknown }).prefix !== prefix ||
+      typeof (parsed as { cursor?: unknown }).cursor !== "string"
+    ) {
+      return undefined;
+    }
+    return (parsed as { cursor: string }).cursor;
+  } catch {
+    return undefined;
+  }
 }
 
 function indexKeyStartsWithPrefix(key: IndexKey, prefix: IndexKey): boolean {
@@ -6210,6 +6236,7 @@ export const listPublicApiPageV1 = query({
   args: {
     cursor: v.optional(v.string()),
     numItems: v.optional(v.number()),
+    prefix: v.optional(v.string()),
     sort: v.optional(
       v.union(
         v.literal("default"),
@@ -6226,10 +6253,55 @@ export const listPublicApiPageV1 = query({
     nonSuspiciousOnly: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
+    const normalizedPrefix = normalizeSkillSlug(args.prefix);
     const requestedSort = normalizePublicListSort(args.sort);
     const dir = resolvePublicListDir(requestedSort, args.dir);
     const numItems = clampInt(args.numItems ?? 25, 1, MAX_PUBLIC_LIST_LIMIT);
     const eqPrefix: IndexKey = args.nonSuspiciousOnly ? [undefined, false] : [undefined];
+    if (normalizedPrefix) {
+      const indexName = args.nonSuspiciousOnly
+        ? "by_nonsuspicious_normalized_slug"
+        : "by_active_normalized_slug";
+      const decodedCursor = decodePublicListCursor({
+        cursor: decodePublicApiPrefixCursor(args.cursor, normalizedPrefix),
+        indexName,
+        // Count declared index fields only; the decoder adds getPage's two tie-breakers.
+        maxIndexKeyLength: args.nonSuspiciousOnly ? 3 : 2,
+        eqPrefix,
+        allowLegacyArray: false,
+      });
+      const normalizedSlugIndex = eqPrefix.length;
+      const cursorSlug = decodedCursor?.[normalizedSlugIndex];
+      const prefixCursor =
+        typeof cursorSlug === "string" && cursorSlug.startsWith(normalizedPrefix)
+          ? decodedCursor
+          : null;
+      const result = await getPage(ctx, {
+        table: "skillSearchDigest",
+        startIndexKey: prefixCursor ?? [...eqPrefix, normalizedPrefix],
+        startInclusive: !prefixCursor,
+        endIndexKey: [...eqPrefix, `${normalizedPrefix}\uffff`],
+        endInclusive: false,
+        absoluteMaxRows: numItems,
+        order: "asc",
+        index: indexName,
+        schema,
+      });
+      const items = [];
+      for (const digest of result.page) {
+        const item = await buildPublicSkillApiListEntryFromDigest(ctx, digest);
+        if (item) items.push(item);
+      }
+      const nextCursor =
+        result.hasMore && result.indexKeys.length > 0
+          ? encodePublicApiPrefixCursor(
+              normalizedPrefix,
+              indexName,
+              result.indexKeys[result.indexKeys.length - 1],
+            )
+          : null;
+      return { items, nextCursor };
+    }
     const recommendedIndexName = args.nonSuspiciousOnly
       ? NONSUSPICIOUS_SORT_INDEXES.recommended
       : SORT_INDEXES.recommended;

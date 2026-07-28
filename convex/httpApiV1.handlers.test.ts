@@ -2075,6 +2075,59 @@ describe("httpApiV1 handlers", () => {
     });
   });
 
+  it("search forwards exact mode", async () => {
+    const runAction = vi.fn().mockResolvedValue([]);
+    const runMutation = vi.fn().mockResolvedValue(okRate());
+    const response = await __handlers.searchSkillsV1Handler(
+      makeCtx({ runAction, runMutation }),
+      new Request("https://example.com/api/v1/search?q=aigroup-alpha&mode=exact&limit=10"),
+    );
+    if (response.status !== 200) {
+      throw new Error(await response.text());
+    }
+    expect(runAction).toHaveBeenCalledWith(expect.anything(), {
+      query: "aigroup-alpha",
+      limit: 10,
+      mode: "exact",
+      highlightedOnly: undefined,
+      nonSuspiciousOnly: undefined,
+    });
+  });
+
+  it("lists a skill slug prefix with a cursor", async () => {
+    const runQuery = vi.fn().mockResolvedValue({ items: [], nextCursor: "next-page" });
+    const runMutation = vi.fn().mockResolvedValue(okRate());
+
+    const response = await __handlers.listSkillsV1Handler(
+      makeCtx({ runQuery, runMutation }),
+      new Request("https://example.com/api/v1/skills?prefix=aigroup-&limit=10&cursor=cursor-1"),
+    );
+
+    expect(response.status).toBe(200);
+    expect(runQuery).toHaveBeenCalledWith(expect.anything(), {
+      cursor: "cursor-1",
+      numItems: 10,
+      sort: "name",
+      dir: "asc",
+      prefix: "aigroup-",
+      nonSuspiciousOnly: undefined,
+    });
+    await expect(response.json()).resolves.toEqual({ items: [], nextCursor: "next-page" });
+  });
+
+  it("search rejects invalid mode", async () => {
+    const runAction = vi.fn().mockResolvedValue([]);
+    const runMutation = vi.fn().mockResolvedValue(okRate());
+    const response = await __handlers.searchSkillsV1Handler(
+      makeCtx({ runAction, runMutation }),
+      new Request("https://example.com/api/v1/search?q=demo&mode=random"),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("Invalid search mode");
+    expect(runAction).not.toHaveBeenCalled();
+  });
+
   it("search forwards legacy nonSuspicious alias", async () => {
     const runAction = vi.fn().mockResolvedValue([]);
     const runMutation = vi.fn().mockResolvedValue(okRate());
