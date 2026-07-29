@@ -8,12 +8,14 @@ schema. ClawHub owns publication, ownership, discovery, package detail APIs,
 and hosted feed export. OpenClaw remains authoritative for local planning,
 consent, mutation, provenance, update, and removal.
 
-The YAML frontmatter is the portable manifest. A `CLAW.md` package envelope
-must have a non-empty body; its exact body text is the implicit managed
-`SOUL.md` workspace file. The manifest must not also declare an explicit
-`SOUL.md` destination. The exact `CLAW.md` bytes, including the body, remain in
-the immutable artifact digest and provenance input. Grouped JSON has no body,
-creates no implicit file, and may declare `SOUL.md` explicitly.
+The YAML frontmatter is the portable manifest. A `CLAW.md` package envelope may
+be frontmatter-only. When its body contains non-whitespace text, the exact body
+text is the implicit managed `SOUL.md` workspace file; an empty or whitespace-only
+body creates no implicit file. The manifest must not declare a workspace
+destination that equals, contains, or is contained by that implicit `SOUL.md`
+path. The exact `CLAW.md` bytes, including the body, remain in the immutable
+artifact digest and provenance input. Grouped JSON has no body, creates no
+implicit file, and may declare `SOUL.md` explicitly.
 
 The portable agent object carries only identity and purpose. Harness-specific
 settings live in package-local profiles addressed through opaque string
@@ -27,6 +29,11 @@ profile's strict v1 OpenClaw policy during publication. OpenClaw validates it
 again during application, includes it in package integrity, and never copies it
 into ordinary OpenClaw configuration. Other harnesses may ignore OpenClaw's
 namespaced key or define their own profile-pointer contract.
+
+ClawHub validates profile shape but treats `agent.tools.profile` as an opaque,
+non-empty applying-harness identifier. It does not freeze OpenClaw's evolving
+built-in profile registry; OpenClaw resolves the identifier against its current
+registry during preview and application.
 
 ## Experimental contract
 
@@ -51,6 +58,10 @@ namespaced key or define their own profile-pointer contract.
 4. Add a separately gated hosted Claws feed and a repeatable published-package
    proof through OpenClaw `claws add --dry-run`
    ([PR #3092](https://github.com/openclaw/clawhub/pull/3092)).
+5. Validate the portable `CLAW.md` prompt body, project it as managed
+   `SOUL.md` capability metadata, and prove the feed-to-OpenClaw mapping
+   ([PR #3262](https://github.com/openclaw/clawhub/pull/3262), stacked after
+   PR #3092).
 
 The hosted projection uses the separate
 [experimental Claw feed contract](experimental-claw-feed.md), not an extension
@@ -83,8 +94,11 @@ Claws use the existing package publication pipeline. `package.json` declares
 the package identity, version, and package-relative `openclaw.claw` manifest
 path. Publication parses `CLAW.md` YAML frontmatter or the JSON compatibility
 form and validates the grouped manifest, referenced workspace files, and any
-declared package-local OpenClaw profile. The release retains the exact artifact
-and a bounded derived summary rather than duplicating the full manifest or
+declared package-local OpenClaw profile. A non-empty Markdown body is the
+portable agent prompt and maps to managed `SOUL.md`; publication rejects a body
+combined with any explicit `SOUL.md` workspace declaration. The release retains
+the exact artifact and a bounded derived summary, including the implicit
+`SOUL.md` capability, rather than duplicating the full manifest, prompt body, or
 OpenClaw profile into Convex storage. The server rejects
 `family: claw` before mutation when the experimental gate is disabled; the gate
 does not bypass ownership, moderation, scanning, or release invariants when
