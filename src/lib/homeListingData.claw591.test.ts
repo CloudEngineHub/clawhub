@@ -70,6 +70,7 @@ describe("homeListingData", () => {
       fetchLimit: HOME_LISTING_PAGE_SIZE,
       items: [{ trending: item }],
       hasMore: true,
+      trendingState: "available",
     });
   });
 
@@ -97,22 +98,53 @@ describe("homeListingData", () => {
     });
   });
 
-  it("falls back to legacy Trending when the canonical rollout is disabled", async () => {
-    const legacy = makeNative("legacy-trending", Date.now(), 10);
+  it("rejects a later canonical page failure instead of replacing loaded results", async () => {
+    const first = makeTrending("first", "First", 12);
+    fetchCanonicalTrendingPageMock
+      .mockResolvedValueOnce(canonicalPage([first], "opaque cursor 2"))
+      .mockRejectedValueOnce(new Error("second page unavailable"));
+
+    await expect(fetchHomeSkillListing("trending", [], 2)).rejects.toThrow(
+      "second page unavailable",
+    );
+    expect(convexQueryMock).not.toHaveBeenCalled();
+  });
+
+  it("reports canonical Trending unavailable without reading the legacy leaderboard", async () => {
     fetchCatalogDiscoveryCapabilitiesMock.mockResolvedValue({
       apiVersion: 0,
       canonicalTrendingEnabled: false,
     });
-    convexQueryMock.mockResolvedValue({ items: [legacy], nextCursor: null });
 
     await expect(fetchHomeSkillListing("trending", [], HOME_LISTING_PAGE_SIZE)).resolves.toEqual({
-      page: [legacy],
+      page: [],
       hasMore: false,
+      trendingState: "unavailable",
     });
-    expect(convexQueryMock).toHaveBeenCalledWith("skills:listPublicTrendingPage", {
-      limit: HOME_LISTING_PAGE_SIZE,
-      categorySlug: undefined,
+    expect(convexQueryMock).not.toHaveBeenCalled();
+    expect(fetchCanonicalTrendingPageMock).not.toHaveBeenCalled();
+  });
+
+  it("reports stale or unavailable canonical Trending without a legacy retry", async () => {
+    fetchCanonicalTrendingPageMock.mockRejectedValue(new Error("Trending snapshot expired"));
+
+    await expect(fetchHomeSkillListing("trending", [], HOME_LISTING_PAGE_SIZE)).resolves.toEqual({
+      page: [],
+      hasMore: false,
+      trendingState: "unavailable",
     });
+    expect(convexQueryMock).not.toHaveBeenCalled();
+  });
+
+  it("reports Trending unavailable when capability discovery fails", async () => {
+    fetchCatalogDiscoveryCapabilitiesMock.mockRejectedValue(new Error("capability outage"));
+
+    await expect(fetchHomeSkillListing("trending", [], HOME_LISTING_PAGE_SIZE)).resolves.toEqual({
+      page: [],
+      hasMore: false,
+      trendingState: "unavailable",
+    });
+    expect(convexQueryMock).not.toHaveBeenCalled();
     expect(fetchCanonicalTrendingPageMock).not.toHaveBeenCalled();
   });
 
