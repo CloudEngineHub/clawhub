@@ -15,6 +15,7 @@ import {
 import { apiRequest, registryUrl } from "../../../clawhub/src/http.js";
 import {
   ApiRoutes,
+  ApiV1PackageValidationReportPageSchema,
   ApiV1PackageHardDeleteResponseSchema,
   ApiV1PackageModerationQueueResponseSchema,
   ApiV1PackageOfficialMigrationListResponseSchema,
@@ -32,6 +33,8 @@ import {
   type PackageReportStatus,
   type PackageReleaseModerationState,
   type PackageTrustedPublisher,
+  type ApiV1PackageValidationReportPage,
+  type PackageValidationReportItem,
 } from "../../../clawhub/src/schema/index.js";
 
 type PackageTrustedPublisherSetOptions = {
@@ -129,6 +132,81 @@ type PackageHardDeleteOptions = {
   json?: boolean;
   yes?: boolean;
 };
+
+type PackageValidationReportOptions = {
+  json?: boolean;
+};
+
+export async function cmdExportPackageValidationReport(
+  opts: GlobalOpts,
+  options: PackageValidationReportOptions = {},
+) {
+  const token = await requireAuthToken();
+  const registry = await getRegistry(opts, { cache: true });
+  const plugins: PackageValidationReportItem[] = [];
+  let cursor: string | null = null;
+  let pages = 0;
+  const seenCursors = new Set<string>();
+  const seenPackageIds = new Set<string>();
+
+  do {
+    const url = registryUrl(`${ApiRoutes.packages}/validation-report`, registry);
+    url.searchParams.set("limit", "100");
+    if (cursor) url.searchParams.set("cursor", cursor);
+    const page = await apiRequest<ApiV1PackageValidationReportPage>(
+      registry,
+      {
+        method: "GET",
+        url: url.toString(),
+        token,
+      },
+      ApiV1PackageValidationReportPageSchema,
+    );
+    pages += 1;
+    for (const plugin of page.items) {
+      if (seenPackageIds.has(plugin.package.id)) {
+        fail(`Validation report response repeated package ${plugin.package.id}`);
+      }
+      seenPackageIds.add(plugin.package.id);
+      plugins.push(plugin);
+    }
+    if (!page.done && !page.nextCursor) {
+      fail("Validation report response omitted its pagination cursor");
+    }
+    const nextCursor = page.done ? null : page.nextCursor;
+    if (nextCursor && seenCursors.has(nextCursor)) {
+      fail("Validation report response repeated a pagination cursor");
+    }
+    if (nextCursor) seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  } while (cursor);
+
+  const byScanStatus = { notScanned: 0, skipped: 0, clean: 0, warning: 0, error: 0 };
+  const bySeverity = { info: 0, warning: 0, error: 0 };
+  let findingTotal = 0;
+  for (const plugin of plugins) {
+    const statusKey = plugin.scan.status === "not-scanned" ? "notScanned" : plugin.scan.status;
+    byScanStatus[statusKey] += 1;
+    for (const finding of plugin.findings) {
+      bySeverity[finding.severity] += 1;
+      findingTotal += 1;
+    }
+  }
+
+  const report = {
+    schemaVersion: 1 as const,
+    generatedAt: new Date().toISOString(),
+    source: { registry, pages },
+    totals: {
+      plugins: plugins.length,
+      byScanStatus,
+      findings: { total: findingTotal, bySeverity },
+    },
+    plugins,
+  };
+  if (options.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  return report;
+}
 
 export async function cmdHardDeletePackage(
   opts: GlobalOpts,
