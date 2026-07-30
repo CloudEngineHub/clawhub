@@ -57,6 +57,12 @@ type PluginInspectorFinding = {
 
 const PLUGIN_VALIDATE_CLI = "clawhub package validate <path-to-plugin>";
 
+function pluginValidateCommand(openClawVersion?: string) {
+  return openClawVersion
+    ? `${PLUGIN_VALIDATE_CLI} --openclaw-version ${openClawVersion}`
+    : PLUGIN_VALIDATE_CLI;
+}
+
 export function DashboardNeedsAttention({ items }: DashboardNeedsAttentionProps) {
   const [selectedGroup, setSelectedGroup] = useState<DashboardAttentionGroup | null>(null);
   const reviewScrollRef = useRef<HTMLDivElement>(null);
@@ -353,7 +359,23 @@ function PluginValidationSheetReview({
   const errors = displayedFindings.filter((finding) => finding.findingKind === "error");
   const warnings = displayedFindings.filter((finding) => finding.findingKind !== "error");
   const version = displayedFindings.find((finding) => finding.version)?.version ?? null;
-  const instructions = buildValidationInstructions(group.title, version, displayedFindings);
+  const targetOpenClawVersions = Array.from(
+    new Set(
+      displayedFindings
+        .map((finding) => finding.targetOpenClawVersion?.trim())
+        .filter((target): target is string => Boolean(target)),
+    ),
+  );
+  const validateCommands = targetOpenClawVersions.length
+    ? targetOpenClawVersions.map(pluginValidateCommand)
+    : [pluginValidateCommand()];
+  const validateCommand = validateCommands.join("\n");
+  const instructions = buildValidationInstructions(
+    group.title,
+    version,
+    displayedFindings,
+    validateCommands,
+  );
 
   return (
     <>
@@ -383,12 +405,20 @@ function PluginValidationSheetReview({
               <span className="plugin-validation-toolbar-label">
                 Validate locally before publishing
               </span>
-              <div className="plugin-validation-toolbar">
+              <div
+                className={`plugin-validation-toolbar${
+                  validateCommands.length > 1 ? " is-multi-target" : ""
+                }`}
+              >
                 <div className="plugin-validation-toolbar-cli">
-                  <code className="plugin-validation-command">{PLUGIN_VALIDATE_CLI}</code>
+                  <code className="plugin-validation-command">{validateCommand}</code>
                   <InstallCopyButton
-                    text={PLUGIN_VALIDATE_CLI}
-                    ariaLabel="Copy validate command"
+                    text={validateCommand}
+                    ariaLabel={
+                      validateCommands.length === 1
+                        ? "Copy validate command"
+                        : "Copy validate commands"
+                    }
                     showLabel={false}
                     className="plugin-validation-toolbar-copy"
                   />
@@ -542,14 +572,17 @@ function buildValidationInstructions(
   packageName: string,
   version: string | null,
   findings: PluginInspectorFinding[],
+  validateCommands: string[],
 ) {
   const lines = [
     `Fix the following OpenClaw plugin validation findings for package "${packageName}".`,
     ...(version ? [`Validated release: v${version}.`] : []),
     "",
     "Make the minimum code and manifest changes needed to resolve every issue below.",
-    "After editing, run locally:",
-    PLUGIN_VALIDATE_CLI,
+    validateCommands.length === 1
+      ? "After editing, run locally:"
+      : "After editing, run locally against every recorded OpenClaw target:",
+    ...validateCommands,
     "",
   ];
   for (const finding of findings) {

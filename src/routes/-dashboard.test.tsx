@@ -49,6 +49,8 @@ const mocks = vi.hoisted(() => ({
   rerenderDashboard: null as null | (() => void),
 }));
 
+const writeTextMock = vi.fn();
+
 vi.mock("convex/react", () => ({
   useQuery: (...args: unknown[]) => mocks.useQuery(...args),
   usePaginatedQuery: (...args: unknown[]) => mocks.usePaginatedQuery(...args),
@@ -366,6 +368,12 @@ describe("Dashboard rows", () => {
     mocks.dashboardSearch = {};
     mocks.rerenderDashboard = null;
     window.localStorage.clear();
+    writeTextMock.mockReset();
+    writeTextMock.mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: writeTextMock },
+    });
     mocks.usePaginatedQuery.mockReturnValue({
       results: [],
       status: "LoadingFirstPage",
@@ -687,21 +695,43 @@ describe("Dashboard rows", () => {
   });
 
   it("links public plugin finding counts to the plugin validation tab", () => {
-    arrangeDashboard({
-      packages: [
-        createPackage({
-          inspectorWarningCount: 2,
-          scanStatus: "clean",
-          stats: { downloads: 42, installs: 9, stars: 0, versions: 1 },
-          latestRelease: {
+    const packages = [
+      createPackage({
+        inspectorWarningCount: 2,
+        scanStatus: "clean",
+        stats: { downloads: 42, installs: 9, stars: 0, versions: 1 },
+        latestRelease: {
+          version: "1.0.0",
+          createdAt: 1,
+          vtStatus: "clean",
+          llmStatus: "clean",
+          staticScanStatus: "clean",
+        },
+      }),
+    ];
+    arrangeDashboard({ packages });
+    mocks.useQuery.mockImplementation((query: unknown, args: unknown) => {
+      if (args === "skip") return undefined;
+      const name = getFunctionName(query as never);
+      if (name === "publishers:listMine") return publishers;
+      if (name === "packages:list") return packages;
+      if (name === "dashboard:getDownloadMetrics") return downloadMetrics;
+      if (name === "packages:listPackageInspectorWarningsForManager") {
+        return [
+          {
+            _id: "packageInspectorWarnings:1",
+            packageName: "local-scanned-runtime-plugin",
             version: "1.0.0",
-            createdAt: 1,
-            vtStatus: "clean",
-            llmStatus: "clean",
-            staticScanStatus: "clean",
+            findingKind: "warning",
+            code: "legacy-before-agent-start",
+            issueClass: "deprecation-warning",
+            severity: "P2",
+            message: "legacy before_agent_start hook is deprecated",
+            targetOpenClawVersion: "0.9.0",
           },
-        }),
-      ],
+        ];
+      }
+      return [];
     });
 
     renderDashboard();
@@ -715,6 +745,86 @@ describe("Dashboard rows", () => {
       screen.getByRole("dialog", { name: "Local Flagged Runtime Plugin review" }),
     ).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Validation" })).toBeTruthy();
+    expect(
+      screen.getByText("clawhub package validate <path-to-plugin> --openclaw-version 0.9.0"),
+    ).toBeTruthy();
+  });
+
+  it("copies one exact validation command per recorded OpenClaw target", async () => {
+    const packages = [
+      createPackage({
+        inspectorWarningCount: 2,
+        scanStatus: "clean",
+        latestRelease: {
+          version: "1.0.0",
+          createdAt: 1,
+          vtStatus: "clean",
+          llmStatus: "clean",
+          staticScanStatus: "clean",
+        },
+      }),
+    ];
+    arrangeDashboard({ packages });
+    mocks.useQuery.mockImplementation((query: unknown, args: unknown) => {
+      if (args === "skip") return undefined;
+      const name = getFunctionName(query as never);
+      if (name === "publishers:listMine") return publishers;
+      if (name === "packages:list") return packages;
+      if (name === "dashboard:getDownloadMetrics") return downloadMetrics;
+      if (name === "packages:listPackageInspectorWarningsForManager") {
+        return [
+          {
+            _id: "packageInspectorWarnings:1",
+            findingKind: "warning",
+            code: "legacy-before-agent-start",
+            message: "legacy hook is deprecated",
+            targetOpenClawVersion: "0.9.0",
+          },
+          {
+            _id: "packageInspectorWarnings:2",
+            findingKind: "error",
+            code: "missing-expected-seam",
+            message: "registerTool is no longer available",
+            targetOpenClawVersion: "0.10.0",
+          },
+        ];
+      }
+      return [];
+    });
+
+    renderDashboard();
+    fireEvent.click(
+      screen.getByRole("button", { name: /Local Flagged Runtime Plugin\. 1 issue/i }),
+    );
+    expect(document.querySelector(".plugin-validation-command")?.textContent).toContain(
+      "clawhub package validate <path-to-plugin> --openclaw-version 0.9.0",
+    );
+    expect(document.querySelector(".plugin-validation-command")?.textContent).toContain(
+      "clawhub package validate <path-to-plugin> --openclaw-version 0.10.0",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Copy validate commands" }));
+    await waitFor(() => {
+      expect(writeTextMock).toHaveBeenCalledWith(
+        [
+          "clawhub package validate <path-to-plugin> --openclaw-version 0.9.0",
+          "clawhub package validate <path-to-plugin> --openclaw-version 0.10.0",
+        ].join("\n"),
+      );
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Copy fix instructions" }));
+
+    await waitFor(() => {
+      expect(writeTextMock).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "clawhub package validate <path-to-plugin> --openclaw-version 0.9.0",
+        ),
+      );
+      expect(writeTextMock).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "clawhub package validate <path-to-plugin> --openclaw-version 0.10.0",
+        ),
+      );
+    });
   });
 
   it("shows a publisher selector and loads org packages when switching publishers", async () => {

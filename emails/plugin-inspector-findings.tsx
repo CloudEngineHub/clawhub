@@ -12,6 +12,7 @@ import {
 
 export type PluginInspectorFindingEmailItem = FindingCardProps & {
   code: string;
+  targetOpenClawVersion?: string;
 };
 
 export type PluginInspectorFindingsEmailProps = {
@@ -19,7 +20,7 @@ export type PluginInspectorFindingsEmailProps = {
   version: string;
   openClawVersion?: string;
   findings: PluginInspectorFindingEmailItem[];
-  validateCommand: string;
+  validateCommands: string[];
   preheader: string;
 };
 
@@ -28,7 +29,7 @@ export default function PluginInspectorFindingsEmail({
   version,
   openClawVersion,
   findings,
-  validateCommand,
+  validateCommands,
   preheader,
 }: PluginInspectorFindingsEmailProps) {
   const issueText = `${findings.length} ${findings.length === 1 ? "issue" : "issues"}`;
@@ -44,11 +45,21 @@ export default function PluginInspectorFindingsEmail({
         ]}
       />
       <HeadingLabel>Findings</HeadingLabel>
-      {findings.map((finding) => (
-        <FindingCard key={finding.code} {...finding} />
+      {findings.map((finding, index) => (
+        <FindingCard
+          key={`${finding.code}:${finding.targetOpenClawVersion ?? index}`}
+          {...finding}
+          meta={
+            finding.targetOpenClawVersion
+              ? `${finding.meta} · OpenClaw ${finding.targetOpenClawVersion}`
+              : finding.meta
+          }
+        />
       ))}
       <HeadingLabel>Validate a local fix</HeadingLabel>
-      <CodeBox>{validateCommand}</CodeBox>
+      {validateCommands.map((command) => (
+        <CodeBox key={command}>{command}</CodeBox>
+      ))}
     </ClawHubEmailLayout>
   );
 }
@@ -72,7 +83,7 @@ PluginInspectorFindingsEmail.PreviewProps = {
   packageName: "demo-plugin",
   version: "1.0.0",
   openClawVersion: "2026.4.0",
-  validateCommand: "clawhub package validate <path-to-plugin>",
+  validateCommands: ["clawhub package validate <path-to-plugin>"],
   preheader: "Plugin Inspector found 1 issue with demo-plugin@1.0.0.",
   findings: [
     {

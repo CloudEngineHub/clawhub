@@ -306,7 +306,9 @@ describe("moderation notification email copy", () => {
     expect(email.text).toContain("OpenClaw Version: 0.9.0");
     expect(email.text).toContain("Address the findings below in your plugin package.");
     expect(email.text).toContain("Run the validation command locally against your changes.");
-    expect(email.text).toContain("clawhub package validate <path-to-plugin>");
+    expect(email.text).toContain(
+      "clawhub package validate <path-to-plugin> --openclaw-version 0.9.0",
+    );
     expect(email.text).toContain(
       "- **WARNING** `legacy-before-agent-start` (deprecation-warning, P2)",
     );
@@ -330,7 +332,9 @@ describe("moderation notification email copy", () => {
     expectFooterLinksUnderlined(email.html);
     expect(email.html).toContain("OpenClaw Version");
     expect(email.html).toContain("0.9.0");
-    expect(email.html).toContain("clawhub package validate &lt;path-to-plugin&gt;");
+    expect(email.html).toContain(
+      "clawhub package validate &lt;path-to-plugin&gt; --openclaw-version 0.9.0",
+    );
     expect(email.html).toContain("legacy-before-agent-start");
     expect(email.html).toContain("legacy-before-agent-start · deprecation-warning · P2");
     expect(email.html).toContain("Fix");
@@ -348,6 +352,49 @@ describe("moderation notification email copy", () => {
     expect(email.html).not.toContain("https://clawhub.ai/plugins/demo-plugin#validation");
     expect(email.html).not.toContain("Your plugin was published");
     expect(email.html).not.toContain("published successfully");
+  });
+
+  it("includes one exact validation command per recorded OpenClaw target", async () => {
+    const email = await buildPackageInspectorFindingsEmail({
+      packageName: "demo-plugin",
+      version: "1.0.0",
+      findings: [
+        {
+          findingKind: "warning",
+          code: "legacy-before-agent-start",
+          message: "legacy hook is deprecated",
+          targetOpenClawVersion: "0.9.0",
+        },
+        {
+          findingKind: "error",
+          code: "missing-expected-seam",
+          message: "registerTool is no longer available",
+          targetOpenClawVersion: "0.10.0",
+        },
+      ],
+    });
+
+    expect(email.text).toContain("OpenClaw Versions: 0.9.0, 0.10.0");
+    expect(email.text).toContain(
+      "clawhub package validate <path-to-plugin> --openclaw-version 0.9.0",
+    );
+    expect(email.text).toContain(
+      "clawhub package validate <path-to-plugin> --openclaw-version 0.10.0",
+    );
+    expect(email.text).toContain(
+      "`legacy-before-agent-start`\n  legacy hook is deprecated\n  OpenClaw target: 0.9.0",
+    );
+    expect(email.text).toContain(
+      "`missing-expected-seam`\n  registerTool is no longer available\n  OpenClaw target: 0.10.0",
+    );
+    expect(email.html).toContain(
+      "clawhub package validate &lt;path-to-plugin&gt; --openclaw-version 0.9.0",
+    );
+    expect(email.html).toContain(
+      "clawhub package validate &lt;path-to-plugin&gt; --openclaw-version 0.10.0",
+    );
+    expect(email.html).toContain("legacy-before-agent-start · OpenClaw 0.9.0");
+    expect(email.html).toContain("missing-expected-seam · OpenClaw 0.10.0");
   });
 
   it("builds plugin inspector error copy without publish-time wording", async () => {
@@ -372,7 +419,9 @@ describe("moderation notification email copy", () => {
     expect(email.text).toContain("We found 1 issue with version 1.0.1 of demo-plugin.");
     expect(email.text).toContain("Address the findings below in your plugin package.");
     expect(email.text).toContain("Run the validation command locally against your changes.");
-    expect(email.text).toContain("clawhub package validate <path-to-plugin>");
+    expect(email.text).toContain(
+      "clawhub package validate <path-to-plugin> --openclaw-version 0.10.0",
+    );
     expect(email.text).toContain("- **ERROR** `missing-expected-seam` (compatibility-error, P0)");
     expect(email.text).not.toContain("Your plugin was published");
     expect(email.text).not.toContain("was published, but");
