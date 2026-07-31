@@ -1,12 +1,65 @@
 /* @vitest-environment node */
 
-import { describe, expect, it } from "vitest";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   buildPublishInspectorRunCheckOptions,
+  createPackageInspectorWorkspace,
   normalizeInspectorReportForPublish,
 } from "./packageInspectorNode";
 
+const originalPlatform = process.platform;
+
+afterEach(() => {
+  Object.defineProperty(process, "platform", { value: originalPlatform });
+});
+
 describe("package inspector publish normalization", () => {
+  it("falls back to /tmp when the configured temp directory is unavailable", async () => {
+    Object.defineProperty(process, "platform", { value: "linux" });
+    const attemptedPrefixes: string[] = [];
+    const createTempDir = async (prefix: string) => {
+      attemptedPrefixes.push(prefix);
+      if (attemptedPrefixes.length === 1) {
+        throw Object.assign(new Error("configured temp directory is unavailable"), {
+          code: "ENOENT",
+        });
+      }
+      return `${prefix}workspace`;
+    };
+
+    await expect(
+      createPackageInspectorWorkspace("/home/sbx_user1051", createTempDir),
+    ).resolves.toBe(path.join("/tmp", "clawhub-plugin-inspector-workspace"));
+    expect(attemptedPrefixes).toEqual([
+      path.join("/home/sbx_user1051", "clawhub-plugin-inspector-"),
+      path.join("/tmp", "clawhub-plugin-inspector-"),
+    ]);
+  });
+
+  it("does not use the POSIX fallback on Windows", async () => {
+    Object.defineProperty(process, "platform", { value: "win32" });
+    const error = Object.assign(new Error("configured temp directory is unavailable"), {
+      code: "ENOENT",
+    });
+    const createTempDir = async () => {
+      throw error;
+    };
+
+    await expect(createPackageInspectorWorkspace("C:\\Temp", createTempDir)).rejects.toBe(error);
+  });
+
+  it("does not hide unrelated workspace creation errors", async () => {
+    const error = Object.assign(new Error("temporary storage failed"), { code: "EIO" });
+    const createTempDir = async () => {
+      throw error;
+    };
+
+    await expect(createPackageInspectorWorkspace("/home/sbx_user1051", createTempDir)).rejects.toBe(
+      error,
+    );
+  });
+
   it("targets latest stable OpenClaw for publish-time inspection", () => {
     expect(buildPublishInspectorRunCheckOptions("/tmp/plugin", "2026-07-30T00:00:00.000Z")).toEqual(
       expect.objectContaining({
