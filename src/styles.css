@@ -7059,11 +7059,33 @@ code {
 .skill-hero-taxonomy-row {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-5);
+  gap: var(--space-3);
   min-width: 0;
   color: color-mix(in srgb, var(--ink-soft) 76%, var(--bg));
   font-size: 12px;
   line-height: 1;
+}
+
+.skill-hero-taxonomy-prefix {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+.skills-sh-sync-source-label {
+  color: inherit;
+  font-weight: 520;
+}
+
+.skills-sh-sync-source {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.skills-sh-sync-source:hover,
+.skills-sh-sync-source:focus-visible {
+  color: var(--ink);
 }
 
 .skill-category-meta-list {
@@ -7326,6 +7348,70 @@ code {
 
 .skill-hero-sidebar .skill-install-command {
   font-size: 0.8rem;
+}
+
+.skills-sh-security-audits {
+  display: grid;
+  gap: 8px;
+  padding: 18px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.skills-sh-security-audits h2 {
+  margin: 0;
+  color: var(--ink-soft);
+  font-family: inherit;
+  font-size: 0.86rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.skills-sh-security-audit-list {
+  display: grid;
+}
+
+.skills-sh-security-audit-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 36px;
+  padding: 8px 0;
+  color: var(--ink);
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.skills-sh-security-audit-verdict {
+  flex: 0 0 auto;
+  border-radius: var(--oc-radius-control);
+  text-transform: uppercase;
+}
+
+a.skills-sh-security-audit-row:hover,
+a.skills-sh-security-audit-row:focus-visible {
+  color: var(--ink);
+  text-decoration: none;
+  background: var(--hover-bg);
+}
+
+.skills-sh-detail-links {
+  display: grid;
+  gap: 8px;
+}
+
+.skills-sh-detail-links .btn {
+  justify-content: flex-start;
+  width: 100%;
+}
+
+.skills-sh-content-note {
+  margin: 0;
+  padding-bottom: 14px;
+  color: var(--ink-soft);
+  font-size: 0.72rem;
 }
 
 .skill-sidebar-actions {
@@ -8799,6 +8885,28 @@ code {
 
   .detail-mobile-install .skill-install-command-shell-cli {
     overflow-x: hidden;
+  }
+
+  .skills-sh-detail-page .detail-mobile-install .skill-install-command-shell-cli {
+    align-items: flex-start;
+  }
+
+  .skills-sh-detail-page .detail-mobile-install .skill-install-command-prompt {
+    align-self: flex-start;
+  }
+
+  .skills-sh-detail-page
+    .detail-mobile-install
+    .skill-install-command-shell-cli
+    .skill-install-command,
+  .skills-sh-detail-page
+    .detail-mobile-install
+    .skill-install-command-shell-cli
+    .skill-install-command
+    code {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
   }
 
   .detail-mobile-install .skill-install-command-shell-cli .skill-install-command,
@@ -22739,7 +22847,7 @@ a.search-empty-action {
 .home-v2-listing-head {
   --home-v2-listing-copy-max: min(54rem, 60vw);
   display: grid;
-  grid-template-columns: auto minmax(0, var(--home-v2-listing-copy-max)) 1fr auto;
+  grid-template-columns: minmax(0, var(--home-v2-listing-copy-max)) 1fr auto;
   gap: 16px 20px;
   align-items: center;
   padding: 0 4px 8px;
@@ -22748,7 +22856,7 @@ a.search-empty-action {
 }
 
 .home-v2-listing-head.has-no-stats {
-  grid-template-columns: auto minmax(0, var(--home-v2-listing-copy-max)) 1fr;
+  grid-template-columns: minmax(0, var(--home-v2-listing-copy-max)) 1fr;
 }
 
 .home-v2-listing-head-icon-spacer {
@@ -22767,11 +22875,11 @@ a.search-empty-action {
 }
 
 .home-v2-listing-head-label {
-  grid-column: 2;
+  grid-column: 1;
 }
 
 .home-v2-listing-head-stat {
-  grid-column: 4;
+  grid-column: 3;
   justify-self: end;
 }
 
@@ -23035,7 +23143,7 @@ a.search-empty-action {
   --home-v2-listing-copy-max: min(54rem, 60vw);
   position: relative;
   display: grid;
-  grid-template-columns: auto minmax(0, var(--home-v2-listing-copy-max)) 1fr auto;
+  grid-template-columns: minmax(0, var(--home-v2-listing-copy-max)) 1fr auto;
   gap: 16px 20px;
   align-items: center;
   padding: 13px 4px;
@@ -23046,7 +23154,7 @@ a.search-empty-action {
 }
 
 .home-v2-listing-row.has-no-stats {
-  grid-template-columns: auto minmax(0, var(--home-v2-listing-copy-max)) 1fr;
+  grid-template-columns: minmax(0, var(--home-v2-listing-copy-max)) 1fr;
 }
 
 .home-v2-listing-row::before {
@@ -23132,7 +23240,7 @@ a.search-empty-action {
 }
 
 .home-v2-listing-row-body {
-  grid-column: 2;
+  grid-column: 1;
   min-width: 0;
   max-width: var(--home-v2-listing-copy-max);
   display: grid;
@@ -23182,6 +23290,20 @@ a.search-empty-action {
   white-space: nowrap;
 }
 
+.home-v2-listing-source-badge {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--hv2-text-tertiary) 42%, transparent);
+  border-radius: var(--r-pill);
+  color: var(--hv2-text-tertiary);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 1.2;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
 .home-v2-listing-row-summary {
   margin: 0;
   font-size: 13px;
@@ -23209,7 +23331,7 @@ a.search-empty-action {
 }
 
 .home-v2-listing-row-stats {
-  grid-column: 4;
+  grid-column: 3;
   display: flex;
   align-items: center;
   justify-content: flex-end;

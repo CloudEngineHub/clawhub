@@ -1,243 +1,312 @@
 import { Link } from "@tanstack/react-router";
+import { BadgeCheck, ShieldAlert } from "lucide-react";
+import { getSkillCategoriesForSkill } from "../lib/categories";
+import { formatCompactStat } from "../lib/numberFormat";
 import {
-  CheckCircle2,
-  CircleHelp,
-  ExternalLink,
-  GitBranch,
-  ShieldAlert,
-  TriangleAlert,
-  XCircle,
-} from "lucide-react";
-import {
-  buildSkillsShInstallCommands,
   isSkillsShCatalogInstallable,
-  SKILLS_SH_TRUST_LABEL,
-  skillsShRepositoryLabel,
   type SkillsShCatalogDetail,
   type SkillsShUpstreamCheck,
 } from "../lib/skillsShCatalog";
-import { timeAgo } from "../lib/timeAgo";
-import { InstallCopyButton } from "./InstallCopyButton";
-import { Container } from "./layout/Container";
+import { truncateText } from "../lib/truncateText";
 import { MarkdownPreview } from "./MarkdownPreview";
+import { SidebarMetadata } from "./SidebarMetadata";
+import { SkillDetailPageView, type SkillDetailViewSkill } from "./SkillDetailPageView";
+import { SkillCommandLineCard } from "./SkillInstallSurface";
 import { Alert, AlertDescription } from "./ui/alert";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
+import { UserBadge } from "./UserBadge";
 
 const CHECK_PRESENTATION = {
-  passed: { Icon: CheckCircle2, className: "text-status-success-fg" },
-  warning: { Icon: TriangleAlert, className: "text-status-warning-fg" },
-  failed: { Icon: XCircle, className: "text-status-error-fg" },
-  unavailable: { Icon: CircleHelp, className: "text-ink-soft" },
+  passed: "success",
+  warning: "warning",
+  failed: "destructive",
+  unavailable: "compact",
 } as const;
+
+function GitHubIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" width={size} height={size} aria-hidden="true">
+      <path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.1.79-.25.79-.56 0-.28-.01-1.02-.02-2-3.2.7-3.88-1.54-3.88-1.54-.52-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.25.45-2.28 1.18-3.08-.12-.29-.51-1.46.11-3.04 0 0 .97-.31 3.16 1.18.92-.26 1.9-.38 2.88-.39.98 0 1.96.13 2.88.39 2.19-1.49 3.15-1.18 3.15-1.18.63 1.58.24 2.75.12 3.04.74.8 1.18 1.83 1.18 3.08 0 4.42-2.69 5.39-5.25 5.67.42.36.78 1.07.78 2.15 0 1.55-.01 2.8-.01 3.18 0 .31.21.67.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z" />
+    </svg>
+  );
+}
+
+function skillsShSummary(summary: string | undefined) {
+  if (!summary) return "Agent-ready skill pack from skills.sh.";
+  const plain = summary
+    .replace(/!\[([^\]]*)\]\([^)]+\)/gu, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/gu, "$1")
+    .replace(/^[#>]+\s*/gmu, "")
+    .replace(/[*_`~]/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return truncateText(plain, 280);
+}
+
+function pinnedGitHubSourceUrl(entry: SkillsShCatalogDetail) {
+  const repositoryUrl = `https://github.com/${entry.canonicalGitHubRepo}`;
+  if (!entry.githubCommit) return entry.canonicalRepoUrl ?? repositoryUrl;
+  if (!entry.githubPath) return `${repositoryUrl}/tree/${entry.githubCommit}`;
+  const encodedPath = entry.githubPath.split("/").map(encodeURIComponent).join("/");
+  return `${repositoryUrl}/tree/${entry.githubCommit}/${encodedPath}`;
+}
 
 export function SkillsShCatalogDetailPage({ entry }: { entry: SkillsShCatalogDetail }) {
   const installable = isSkillsShCatalogInstallable(entry);
+  const githubOwner = entry.canonicalGitHubRepo.split("/")[0] ?? entry.canonicalGitHubRepo;
+  const skill: SkillDetailViewSkill = {
+    slug: entry.slug,
+    displayName: entry.displayName,
+    summary: skillsShSummary(entry.summary),
+    icon: null,
+    ...(installable
+      ? { installKind: "github" as const, githubSourceRepo: entry.canonicalGitHubRepo }
+      : {}),
+    categories: entry.categories,
+    inferredCategories: [],
+    topics: entry.topics,
+    badges: {},
+    stats: {
+      downloads: entry.upstreamInstalls,
+      stars: 0,
+      installs: entry.upstreamInstalls,
+      versions: 0,
+      comments: 0,
+    },
+    updatedAt: entry.lastObservedAt,
+  };
+
+  const installContent = installable ? (
+    <SkillCommandLineCard
+      slug={entry.slug}
+      displayName={entry.displayName}
+      ownerHandle={entry.owner ?? null}
+      ownerId={null}
+      installTarget={entry.reference}
+      skillPageUrl={null}
+    />
+  ) : (
+    <Alert variant="warn">
+      <ShieldAlert aria-hidden="true" size={17} />
+      <AlertDescription>
+        This snapshot does not include a commit-pinned GitHub folder, so it cannot be installed yet.
+      </AlertDescription>
+    </Alert>
+  );
+
   return (
-    <main className="py-10 sm:py-14">
-      <Container size="narrow">
-        <div className="flex flex-col gap-5 border-b border-[color:var(--oc-border-subtle)] pb-7 sm:flex-row sm:items-start sm:justify-between">
-          <div className="min-w-0">
-            <p className="break-all font-mono text-xs text-[color:var(--oc-text-muted)]">
-              {entry.reference}
-            </p>
-            <h1 className="mt-2 font-display text-3xl font-black leading-tight text-[color:var(--oc-text-primary)] sm:text-4xl">
-              {entry.displayName}
-            </h1>
-            {entry.summary ? (
-              <p className="mt-3 max-w-2xl text-sm leading-6 text-[color:var(--oc-text-secondary)] sm:text-base">
-                {entry.summary}
-              </p>
-            ) : null}
-          </div>
-          <Badge variant="warning" className="shrink-0 self-start">
-            <ShieldAlert aria-hidden="true" size={15} /> {SKILLS_SH_TRUST_LABEL}
-          </Badge>
-        </div>
-
-        <Alert variant="warn" className="mt-7">
-          <ShieldAlert aria-hidden="true" size={17} />
-          <AlertDescription>
-            This is a stored upstream skills.sh listing. ClawHub has not scanned or accepted this
-            source.
-          </AlertDescription>
-        </Alert>
-
-        <dl className="grid grid-cols-1 gap-x-8 gap-y-6 py-7 sm:grid-cols-2">
-          <DetailField label="Source" value={skillsShRepositoryLabel(entry)} mono />
-          <DetailField label="Freshness" value={`Observed ${timeAgo(entry.lastObservedAt)}`} />
-          {entry.githubPath ? <DetailField label="Path" value={entry.githubPath} mono /> : null}
-          {entry.githubCommit ? (
-            <DetailField label="Commit" value={entry.githubCommit} mono />
-          ) : null}
-        </dl>
-
-        <div className="flex flex-wrap gap-3 border-b border-[color:var(--oc-border-subtle)] pb-7">
+    <SkillDetailPageView
+      pageClassName="skills-sh-detail-page"
+      skill={skill}
+      owner={null}
+      ownerHandle={entry.owner ?? null}
+      latestVersion={null}
+      modInfo={null}
+      canManage={false}
+      isAuthenticated={false}
+      isStaff={false}
+      isStarred={false}
+      onToggleStar={() => undefined}
+      onOpenReport={() => undefined}
+      onRequireSignIn={() => undefined}
+      forkOf={null}
+      forkOfLabel="fork of"
+      forkOfHref={null}
+      forkOfOwnerHandle={null}
+      canonical={null}
+      canonicalHref={null}
+      canonicalOwnerHandle={null}
+      staffVisibilityTag={null}
+      isAutoHidden={false}
+      isRemoved={false}
+      nixPlugin={undefined}
+      hasPluginBundle={false}
+      configRequirements={undefined}
+      cliHelp={undefined}
+      clawdis={undefined}
+      categories={getSkillCategoriesForSkill(skill)}
+      showArchiveMetadata={false}
+      showBookmarkAction={false}
+      showReportAction={false}
+      taxonomyPrefix={
+        <span className="skills-sh-sync-source-label">
+          Synced from{" "}
           <a
-            className="inline-flex items-center gap-1.5 text-sm font-semibold text-[color:var(--oc-accent-primary)] hover:underline"
+            className="skills-sh-sync-source"
             href={entry.sourceUrl}
             target="_blank"
             rel="noreferrer"
           >
-            View on skills.sh <ExternalLink aria-hidden="true" size={14} />
+            skills.sh
           </a>
-          {entry.canonicalRepoUrl ? (
-            <a
-              className="inline-flex items-center gap-1.5 text-sm font-semibold text-[color:var(--oc-text-secondary)] hover:underline"
-              href={entry.canonicalRepoUrl}
-              target="_blank"
-              rel="noreferrer"
-            >
-              View repository <ExternalLink aria-hidden="true" size={14} />
-            </a>
-          ) : null}
-        </div>
-
-        <section className="border-b border-[color:var(--oc-border-subtle)] py-7">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <h2 className="font-display text-lg font-bold text-[color:var(--oc-text-primary)]">
-              Install
-            </h2>
-            {entry.githubPath && entry.githubCommit && entry.githubContentHash ? (
-              <Button asChild variant="outline" size="sm">
-                <Link
-                  to="/settings"
-                  search={{
-                    view: "githubSources",
-                    ownerHandle: entry.canonicalGitHubRepo.split("/")[0],
-                    repo: entry.canonicalGitHubRepo,
-                    sourceRepo: entry.canonicalGitHubRepo,
-                    sourceExternalId: entry.externalId,
-                    sourcePath: entry.githubPath,
-                    sourceCommit: entry.githubCommit,
-                    sourceContentHash: entry.githubContentHash,
-                  }}
-                >
-                  <GitBranch size={15} aria-hidden="true" /> Claim
-                </Link>
-              </Button>
-            ) : null}
-          </div>
-          {installable ? (
-            <div className="mt-3 grid gap-3">
-              {buildSkillsShInstallCommands(entry.reference).map(({ client, command }) => (
-                <div key={client}>
-                  <p className="mb-1 text-xs font-semibold text-[color:var(--oc-text-muted)]">
-                    {client}
-                  </p>
-                  <div className="flex min-w-0 items-center gap-2 rounded-[var(--oc-radius-inset)] border border-[color:var(--oc-border-subtle)] bg-[color:var(--oc-bg-surface)] p-2 pl-3">
-                    <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap font-mono text-sm text-[color:var(--oc-text-primary)]">
-                      {command}
-                    </code>
-                    <InstallCopyButton
-                      text={command}
-                      ariaLabel={`Copy ${client} install command`}
-                      showLabel={false}
-                      variant="ghost"
-                      size="icon-sm"
-                    />
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <Alert variant="warn" className="mt-3">
-              <ShieldAlert aria-hidden="true" size={17} />
-              <AlertDescription>
-                This snapshot does not include a commit-pinned GitHub folder, so it cannot be
-                installed yet.
-              </AlertDescription>
-            </Alert>
-          )}
-        </section>
-
-        <section className="border-b border-[color:var(--oc-border-subtle)] py-7">
-          <div className="flex flex-wrap items-baseline justify-between gap-2">
-            <h2 className="font-display text-lg font-bold text-[color:var(--oc-text-primary)]">
-              Upstream checks
-            </h2>
-            <p className="text-xs text-[color:var(--oc-text-muted)]">
-              Upstream checks are separate from ClawHub scanning.
-            </p>
-          </div>
-          <div className="mt-4 grid gap-2 sm:grid-cols-3">
-            {entry.upstreamChecks.map((check) => (
-              <UpstreamCheck key={check.scanner} check={check} />
-            ))}
-          </div>
-        </section>
-
-        {entry.content ? (
-          <section className="pt-7">
-            <div className="flex flex-wrap items-baseline justify-between gap-2">
-              <h2 className="font-display text-lg font-bold text-[color:var(--oc-text-primary)]">
-                Stored {entry.content.kind === "skill-md" ? "SKILL.md" : "README"}
-              </h2>
-              <code className="break-all text-xs text-[color:var(--oc-text-muted)]">
-                {entry.content.path}
-              </code>
-            </div>
-            {entry.content.truncated ? (
-              <p className="mt-2 text-xs text-[color:var(--oc-text-muted)]">
-                Content is truncated to the stored 64 KiB snapshot.
-              </p>
-            ) : null}
-            <MarkdownPreview className="mt-5">{entry.content.markdown}</MarkdownPreview>
-          </section>
-        ) : null}
-      </Container>
-    </main>
+        </span>
+      }
+      breadcrumbOwnerHref={null}
+      breadcrumbOwnerLabel={entry.owner ?? "skills.sh"}
+      breadcrumbSkillHref={entry.route}
+      creatorContent={
+        <UserBadge
+          user={{
+            handle: githubOwner,
+            displayName: githubOwner,
+            image: `https://github.com/${githubOwner}.png?size=96`,
+          }}
+          fallbackHandle={githubOwner}
+          prefix=""
+          size="md"
+          showName
+          showHandle={false}
+          showMutedHandle
+          stackMutedHandleBelowName
+          disableTooltip
+          profileHref={`https://github.com/${githubOwner}`}
+        />
+      }
+      installContent={installContent}
+      renderSidebarContent={() => <SkillsShSidebar entry={entry} />}
+    >
+      <SkillsShContentTabs entry={entry} />
+    </SkillDetailPageView>
   );
 }
 
-function DetailField({
-  label,
-  value,
-  mono = false,
-}: {
-  label: string;
-  value: string;
-  mono?: boolean;
-}) {
+function SkillsShSidebar({ entry }: { entry: SkillsShCatalogDetail }) {
   return (
-    <div className="min-w-0">
-      <dt className="text-xs font-semibold text-[color:var(--oc-text-muted)]">{label}</dt>
-      <dd
-        className={`mt-1 break-all text-sm text-[color:var(--oc-text-primary)]${mono ? " font-mono" : ""}`}
+    <div className="skill-hero-sidebar-stack">
+      <SidebarMetadata
+        ariaLabel="skills.sh metadata"
+        density="compact"
+        blocks={[
+          {
+            label: "Downloads",
+            value: (
+              <span title={`${entry.upstreamInstalls.toLocaleString()} downloads`}>
+                {formatCompactStat(entry.upstreamInstalls)}
+              </span>
+            ),
+            large: true,
+          },
+          {
+            label: "Repository",
+            value: (
+              <a
+                href={pinnedGitHubSourceUrl(entry)}
+                target="_blank"
+                rel="noreferrer"
+                className="plugin-external-link"
+              >
+                <GitHubIcon />
+                {entry.canonicalGitHubRepo}
+              </a>
+            ),
+          },
+          ...(entry.githubCommit
+            ? [
+                {
+                  label: "Commit",
+                  value: <code>{entry.githubCommit.slice(0, 12)}</code>,
+                },
+              ]
+            : []),
+        ]}
+      />
+
+      <section className="skills-sh-security-audits" aria-label="Security Audits">
+        <h2 className="sidebar-metadata-label">Security Audits</h2>
+        <div className="skills-sh-security-audit-list">
+          {entry.upstreamChecks.map((check) => (
+            <UpstreamCheck key={check.scanner} check={check} />
+          ))}
+        </div>
+      </section>
+
+      <div className="skills-sh-detail-links">
+        {entry.githubPath && entry.githubCommit && entry.githubContentHash ? (
+          <Button asChild variant="outline" size="sm">
+            <Link
+              to="/settings"
+              search={{
+                view: "githubSources",
+                ownerHandle: entry.canonicalGitHubRepo.split("/")[0],
+                repo: entry.canonicalGitHubRepo,
+                sourceRepo: entry.canonicalGitHubRepo,
+                sourceExternalId: entry.externalId,
+                sourcePath: entry.githubPath,
+                sourceCommit: entry.githubCommit,
+                sourceContentHash: entry.githubContentHash,
+              }}
+            >
+              <BadgeCheck size={15} aria-hidden="true" /> Claim this skill
+            </Link>
+          </Button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function SkillsShContentTabs({ entry }: { entry: SkillsShCatalogDetail }) {
+  return (
+    <div className="tab-card detail-mobile-tabs skill-detail-tabs-card">
+      <div className="tab-header" role="tablist" aria-label="Skill detail tabs">
+        <button
+          id="skill-tab-readme"
+          className="tab-button is-active"
+          type="button"
+          role="tab"
+          aria-selected="true"
+          aria-controls="skill-tabpanel-readme"
+        >
+          {entry.content?.kind === "readme" ? "README" : "SKILL.md"}
+        </button>
+      </div>
+      <div
+        className="tab-body skill-readme-body"
+        role="tabpanel"
+        id="skill-tabpanel-readme"
+        aria-labelledby="skill-tab-readme"
       >
-        {value}
-      </dd>
+        {entry.content ? (
+          <>
+            {entry.content.truncated ? (
+              <p className="skills-sh-content-note">
+                Content is truncated to the stored 64 KiB snapshot.
+              </p>
+            ) : null}
+            <div className="skill-readme-preview">
+              <MarkdownPreview highlight={false}>{entry.content.markdown}</MarkdownPreview>
+            </div>
+          </>
+        ) : (
+          <div className="empty-state px-[var(--space-4)] py-[var(--space-6)]">
+            <p className="empty-state-title">No stored content available</p>
+            <p className="empty-state-body">This skills.sh listing has no stored Markdown.</p>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
 
 function UpstreamCheck({ check }: { check: SkillsShUpstreamCheck }) {
-  const presentation = CHECK_PRESENTATION[check.status];
-  const Icon = presentation.Icon;
-  return (
-    <div className="rounded-[var(--oc-radius-inset)] border border-[color:var(--oc-border-subtle)] bg-[color:var(--oc-bg-surface)] px-3 py-3">
-      <div className="flex items-center gap-2">
-        <Icon aria-hidden="true" size={15} className={presentation.className} />
-        <span className="text-sm font-semibold text-[color:var(--oc-text-primary)]">
-          {check.scanner}
-        </span>
-      </div>
-      <p className={`mt-1 text-xs font-medium ${presentation.className}`}>{check.sourceStatus}</p>
-      {check.checkedAt ? (
-        <p className="mt-1 text-xs text-[color:var(--oc-text-muted)]">
-          Checked {timeAgo(check.checkedAt)}
-        </p>
-      ) : null}
-      {check.url ? (
-        <a
-          className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-[color:var(--oc-accent-primary)] hover:underline"
-          href={check.url}
-          target="_blank"
-          rel="noreferrer"
-        >
-          View result <ExternalLink aria-hidden="true" size={12} />
-        </a>
-      ) : null}
-    </div>
+  const content = (
+    <>
+      <span>{check.scanner}</span>
+      <Badge
+        variant={CHECK_PRESENTATION[check.status]}
+        size="sm"
+        className="skills-sh-security-audit-verdict"
+      >
+        {check.sourceStatus}
+      </Badge>
+    </>
+  );
+  return check.url ? (
+    <a className="skills-sh-security-audit-row" href={check.url} target="_blank" rel="noreferrer">
+      {content}
+    </a>
+  ) : (
+    <div className="skills-sh-security-audit-row">{content}</div>
   );
 }
