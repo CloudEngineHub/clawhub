@@ -9,6 +9,7 @@ import { requestPublishAttemptDispatch } from "./publishAttemptDispatch";
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const CHECK_CLAIM_LEASE_MS = 30 * 60 * 1000;
 const CHECK_RETRY_BACKOFF_MS = 5 * 60 * 1000;
+const MAX_CONSECUTIVE_SCANNER_FAILURES = 3;
 const FINALIZATION_CLAIM_LEASE_MS = 10 * 60 * 1000;
 const PUBLISH_ATTEMPT_STATUSES = [
   "pending_checks",
@@ -107,6 +108,14 @@ function scannerFailureSummary(args: {
   return "Pre-publication scanner failed before returning a verdict.";
 }
 
+function previousScannerFailureCount(attempt: Doc<"publishAttempts">) {
+  if (attempt.checkFailureCount !== undefined) return attempt.checkFailureCount;
+  return attempt.checks.trufflehog.status === "failed" ||
+    attempt.checks.clawscan.status === "failed"
+    ? 1
+    : 0;
+}
+
 function isTerminalFinalizationConflict(error: string | undefined) {
   return (
     typeof error === "string" &&
@@ -136,6 +145,7 @@ function releaseFinalizationClaimPatch(error: string | undefined, now: number) {
     checkClaimedAt: undefined,
     checkClaimExpiresAt: undefined,
     checkClaimLastError: undefined,
+    checkFailureCount: undefined,
     finalizationClaimId: undefined,
     finalizationClaimedAt: undefined,
     finalizationClaimExpiresAt: undefined,
@@ -683,6 +693,7 @@ export const completePendingPublishAttemptChecksInternal = internalMutation({
         checkClaimedAt: undefined,
         checkClaimExpiresAt: undefined,
         checkClaimLastError: undefined,
+        checkFailureCount: undefined,
         blockedAt: now,
         updatedAt: now,
       });
@@ -725,6 +736,7 @@ export const completePendingPublishAttemptChecksInternal = internalMutation({
         checkClaimedAt: undefined,
         checkClaimExpiresAt: undefined,
         checkClaimLastError: undefined,
+        checkFailureCount: undefined,
         blockedAt: now,
         updatedAt: now,
       });
@@ -736,17 +748,24 @@ export const completePendingPublishAttemptChecksInternal = internalMutation({
     }
 
     if (args.trufflehog.status === "failed" || args.clawscan.status === "failed") {
+      const checkFailureCount = previousScannerFailureCount(attempt) + 1;
+      const terminal = checkFailureCount >= MAX_CONSECUTIVE_SCANNER_FAILURES;
       await ctx.db.patch(attempt._id, {
-        status: "pending_checks",
+        status: terminal ? "failed" : "pending_checks",
         checks,
         checkClaimId: undefined,
         checkClaimedAt: undefined,
-        checkClaimExpiresAt: now + CHECK_RETRY_BACKOFF_MS,
+        checkClaimExpiresAt: terminal ? undefined : now + CHECK_RETRY_BACKOFF_MS,
         checkClaimLastError: scannerFailureSummary(args),
-        failedAt: undefined,
+        checkFailureCount,
+        failedAt: terminal ? now : undefined,
         updatedAt: now,
       });
-      return { attemptId: attempt._id, kind: attempt.kind, status: "pending_checks" as const };
+      return {
+        attemptId: attempt._id,
+        kind: attempt.kind,
+        status: terminal ? ("failed" as const) : ("pending_checks" as const),
+      };
     }
 
     if (attempt.kind === "skill" && attempt.skillVersionId && args.clawscanAnalysis) {
@@ -777,6 +796,7 @@ export const completePendingPublishAttemptChecksInternal = internalMutation({
       checkClaimedAt: undefined,
       checkClaimExpiresAt: undefined,
       checkClaimLastError: undefined,
+      checkFailureCount: undefined,
       updatedAt: now,
     });
     return { attemptId: attempt._id, kind: attempt.kind, status: "ready_to_finalize" as const };
