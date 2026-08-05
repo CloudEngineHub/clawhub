@@ -30,6 +30,7 @@ import {
 } from "./lib/skillQuality";
 import { getFrontmatterValue, hashSkillFiles } from "./lib/skills";
 import { computeIsSuspicious } from "./lib/skillSafety";
+import { getFirstSearchToken, getMirrorFirstSearchToken } from "./lib/skillSearchDigest";
 import { generateSkillSummary } from "./lib/skillSummary";
 
 const DEFAULT_BATCH_SIZE = 50;
@@ -2744,6 +2745,208 @@ export const backfillSkillSearchDigestModerationVerdicts: ReturnType<typeof acti
     assertRole(user, ["admin"]);
     return await ctx.runMutation(
       internal.maintenance.backfillSkillSearchDigestModerationVerdictsInternal,
+      args,
+    );
+  },
+});
+
+const SKILL_SEARCH_DIGEST_FIRST_TOKEN_BACKFILL_CONFIRM =
+  "backfill-skill-search-digest-first-tokens" as const;
+const SKILLS_SH_MIRROR_DIGEST_FIRST_TOKEN_BACKFILL_CONFIRM =
+  "backfill-skills-sh-mirror-digest-first-tokens" as const;
+
+// Recompute the stored first-token fields on skillSearchDigest rows. Those values are
+// produced by the search tokenizer, so a tokenizer change leaves already-written rows
+// holding tokens the current search no longer looks for. Run once after deploying such a
+// change, preview first:
+//   npx convex run maintenance:backfillSkillSearchDigestFirstTokens --prod
+//   npx convex run maintenance:backfillSkillSearchDigestFirstTokens \
+//     '{"dryRun": false, "confirm": "backfill-skill-search-digest-first-tokens"}' --prod
+export const backfillSkillSearchDigestFirstTokensInternal = internalMutation({
+  args: {
+    cursor: v.optional(v.string()),
+    batchSize: v.optional(v.number()),
+    delayMs: v.optional(v.number()),
+    dryRun: v.optional(v.boolean()),
+    confirm: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const batchSize = clampInt(args.batchSize ?? 100, 10, 200);
+    // Catalog search subscribes to skillSearchDigest, so batches are spaced out to keep the
+    // backfill from driving reactive re-reads back to back.
+    const delayMs = clampInt(args.delayMs ?? 500, 0, 60_000);
+    // Preview unless the caller opts into applying, matching the catalog-digest resync
+    // contract: an omitted argument must never start a table-wide write.
+    const dryRun = args.dryRun !== false;
+    if (!dryRun && args.confirm !== SKILL_SEARCH_DIGEST_FIRST_TOKEN_BACKFILL_CONFIRM) {
+      throw new ConvexError(
+        `Pass confirm="${SKILL_SEARCH_DIGEST_FIRST_TOKEN_BACKFILL_CONFIRM}" to apply.`,
+      );
+    }
+    const { page, continueCursor, isDone } = await ctx.db
+      .query("skillSearchDigest")
+      .paginate({ cursor: args.cursor ?? null, numItems: batchSize });
+
+    let patched = 0;
+    let missingSkills = 0;
+    for (const digest of page) {
+      const skill = await ctx.db.get(digest.skillId);
+      if (!skill) {
+        missingSkills++;
+        continue;
+      }
+
+      const normalizedSlugFirstToken = getFirstSearchToken(skill.slug);
+      const normalizedDisplayNameFirstToken = getFirstSearchToken(skill.displayName);
+      if (
+        digest.normalizedSlugFirstToken === normalizedSlugFirstToken &&
+        digest.normalizedDisplayNameFirstToken === normalizedDisplayNameFirstToken
+      ) {
+        continue;
+      }
+
+      patched++;
+      if (!dryRun) {
+        await ctx.db.patch(digest._id, {
+          normalizedSlugFirstToken,
+          normalizedDisplayNameFirstToken,
+        });
+      }
+    }
+
+    if (!dryRun && !isDone) {
+      await ctx.scheduler.runAfter(
+        delayMs,
+        internal.maintenance.backfillSkillSearchDigestFirstTokensInternal,
+        {
+          cursor: continueCursor,
+          batchSize: args.batchSize,
+          delayMs: args.delayMs,
+          dryRun,
+          // Continuations re-enter the same guard, so the token has to travel with them.
+          confirm: args.confirm,
+        },
+      );
+    }
+
+    return {
+      scanned: page.length,
+      patched,
+      missingSkills,
+      cursor: continueCursor,
+      isDone,
+      dryRun,
+      confirmRequired: dryRun ? SKILL_SEARCH_DIGEST_FIRST_TOKEN_BACKFILL_CONFIRM : undefined,
+    };
+  },
+});
+
+export const backfillSkillSearchDigestFirstTokens: ReturnType<typeof action> = action({
+  args: {
+    cursor: v.optional(v.string()),
+    batchSize: v.optional(v.number()),
+    delayMs: v.optional(v.number()),
+    dryRun: v.optional(v.boolean()),
+    confirm: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const { user } = await requireUserFromAction(ctx);
+    assertRole(user, ["admin"]);
+    return await ctx.runMutation(
+      internal.maintenance.backfillSkillSearchDigestFirstTokensInternal,
+      args,
+    );
+  },
+});
+
+// Recompute the stored first-token fields on skillsShMirrorDigests rows. The skills.sh
+// mirror derives them through the same tokenizer as the native digest above, and external
+// candidate search range-scans them, so a tokenizer change strands mirrored rows the same
+// way. Run once after deploying such a change, preview first:
+//   npx convex run maintenance:backfillSkillsShMirrorDigestFirstTokens --prod
+//   npx convex run maintenance:backfillSkillsShMirrorDigestFirstTokens \
+//     '{"dryRun": false, "confirm": "backfill-skills-sh-mirror-digest-first-tokens"}' --prod
+export const backfillSkillsShMirrorDigestFirstTokensInternal = internalMutation({
+  args: {
+    cursor: v.optional(v.string()),
+    batchSize: v.optional(v.number()),
+    delayMs: v.optional(v.number()),
+    dryRun: v.optional(v.boolean()),
+    confirm: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const batchSize = clampInt(args.batchSize ?? 100, 10, 200);
+    // The catalog subscribes to mirrored rows too, so pages are spaced apart here as well.
+    const delayMs = clampInt(args.delayMs ?? 500, 0, 60_000);
+    // Same preview-then-confirm contract as the native backfill above.
+    const dryRun = args.dryRun !== false;
+    if (!dryRun && args.confirm !== SKILLS_SH_MIRROR_DIGEST_FIRST_TOKEN_BACKFILL_CONFIRM) {
+      throw new ConvexError(
+        `Pass confirm="${SKILLS_SH_MIRROR_DIGEST_FIRST_TOKEN_BACKFILL_CONFIRM}" to apply.`,
+      );
+    }
+    const { page, continueCursor, isDone } = await ctx.db
+      .query("skillsShMirrorDigests")
+      .paginate({ cursor: args.cursor ?? null, numItems: batchSize });
+
+    let patched = 0;
+    for (const digest of page) {
+      const normalizedSlugFirstToken = getMirrorFirstSearchToken(digest.slug);
+      const normalizedDisplayNameFirstToken = getMirrorFirstSearchToken(digest.displayName);
+      if (
+        digest.normalizedSlugFirstToken === normalizedSlugFirstToken &&
+        digest.normalizedDisplayNameFirstToken === normalizedDisplayNameFirstToken
+      ) {
+        continue;
+      }
+
+      patched++;
+      if (!dryRun) {
+        await ctx.db.patch(digest._id, {
+          normalizedSlugFirstToken,
+          normalizedDisplayNameFirstToken,
+        });
+      }
+    }
+
+    if (!dryRun && !isDone) {
+      await ctx.scheduler.runAfter(
+        delayMs,
+        internal.maintenance.backfillSkillsShMirrorDigestFirstTokensInternal,
+        {
+          cursor: continueCursor,
+          batchSize: args.batchSize,
+          delayMs: args.delayMs,
+          dryRun,
+          confirm: args.confirm,
+        },
+      );
+    }
+
+    return {
+      scanned: page.length,
+      patched,
+      cursor: continueCursor,
+      isDone,
+      dryRun,
+      confirmRequired: dryRun ? SKILLS_SH_MIRROR_DIGEST_FIRST_TOKEN_BACKFILL_CONFIRM : undefined,
+    };
+  },
+});
+
+export const backfillSkillsShMirrorDigestFirstTokens: ReturnType<typeof action> = action({
+  args: {
+    cursor: v.optional(v.string()),
+    batchSize: v.optional(v.number()),
+    delayMs: v.optional(v.number()),
+    dryRun: v.optional(v.boolean()),
+    confirm: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const { user } = await requireUserFromAction(ctx);
+    assertRole(user, ["admin"]);
+    return await ctx.runMutation(
+      internal.maintenance.backfillSkillsShMirrorDigestFirstTokensInternal,
       args,
     );
   },

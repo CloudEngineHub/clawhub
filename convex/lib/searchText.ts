@@ -1,4 +1,10 @@
-const CJK_RE = /[\u4e00-\u9fff\u3400-\u4dbf\u3041-\u3096\u30a1-\u30fa\uac00-\ud7af]/;
+// U+30FC (ー) and U+3005 (々) extend the word they follow, so the pre-split in tokenize()
+// must keep them with that word instead of treating them as separators.
+const CJK_RE = /[\u4e00-\u9fff\u3400-\u4dbf\u3041-\u3096\u30a1-\u30fa\u30fc\u3005\uac00-\ud7af]/;
+
+// The same two marks the class above admits: they extend the preceding character rather
+// than standing on their own, so the per-character fallback must not emit them alone.
+const CJK_EXTENDER_RE = /[\u30fc\u3005]/;
 
 const hasSegmenter = typeof Intl !== "undefined" && "Segmenter" in Intl;
 
@@ -34,9 +40,12 @@ function getKoSegmenter(): Intl.Segmenter {
 function segmentCJKByChar(text: string): string[] {
   const tokens: string[] = [];
   for (const ch of text) {
-    if (CJK_RE.test(ch)) {
-      tokens.push(ch);
+    if (!CJK_RE.test(ch)) continue;
+    if (CJK_EXTENDER_RE.test(ch) && tokens.length > 0) {
+      tokens[tokens.length - 1] += ch;
+      continue;
     }
+    tokens.push(ch);
   }
   return tokens;
 }
@@ -116,7 +125,7 @@ export function tokenize(value: string): string[] {
   const tokens: string[] = [];
 
   const parts = normalized.split(
-    /([^\u4e00-\u9fff\u3400-\u4dbf\u3041-\u3096\u30a1-\u30fa\uac00-\ud7af]+)/g,
+    /([^\u4e00-\u9fff\u3400-\u4dbf\u3041-\u3096\u30a1-\u30fa\u30fc\u3005\uac00-\ud7af]+)/g,
   );
 
   for (const part of parts) {
