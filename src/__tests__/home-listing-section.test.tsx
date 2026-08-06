@@ -168,8 +168,24 @@ describe("HomeListingSection", () => {
     expect(screen.getByText("Demo Plugin")).toBeTruthy();
     expect(document.querySelector(".home-v2-listing-list")).toBeTruthy();
     expect(screen.getByText("Downloads")).toBeTruthy();
-    expect(document.querySelector(".home-v2-listing-row-icon")).toBeNull();
+    expect(document.querySelectorAll(".home-v2-listing-row-icon")).toHaveLength(1);
+    expect(
+      document
+        .querySelector<HTMLImageElement>(".home-v2-listing-row-icon img")
+        ?.getAttribute("src"),
+    ).toBe(featuredPlugin.icon);
     expect(document.querySelector(".home-v2-listing-row-stats svg")).toBeNull();
+  });
+
+  it("keeps the initial Skills skeleton iconless", () => {
+    fetchCatalogDiscoveryCapabilitiesMock.mockReturnValue(new Promise(() => {}));
+
+    render(<HomeListingSection />);
+
+    const loadingResults = screen.getByRole("status", { name: "Loading results" });
+    expect(loadingResults.querySelector(".browse-results-skeleton-icon")).toBeNull();
+    expect(loadingResults.querySelector(".browse-list-head-icon-spacer")).toBeNull();
+    expect(loadingResults.querySelectorAll(".skill-list-item-no-icon")).toHaveLength(6);
   });
 
   it("previews long skill and plugin names while retaining their full labels", async () => {
@@ -261,6 +277,8 @@ describe("HomeListingSection", () => {
     );
 
     expect(screen.getByText("Initial Skill")).toBeTruthy();
+    expect(document.querySelector(".home-v2-listing-row-icon")).toBeNull();
+    expect(document.querySelector(".marketplace-icon-skill")).toBeNull();
     expect(screen.getByRole("button", { name: "Load more" })).toBeTruthy();
     await waitFor(() => {
       expect(convexQueryMock).not.toHaveBeenCalled();
