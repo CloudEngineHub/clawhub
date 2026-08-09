@@ -3215,7 +3215,11 @@ export const listVersionsForViewerInternal = internalQuery({
     const result = await paginatePublishedPackageReleases(ctx, pkg._id, args.paginationOpts);
     return {
       ...result,
-      page: result.page.map((release) => toPublicPackageRelease(release, pkg.family)),
+      page: result.page.map((release) => ({
+        ...toPublicPackageRelease(release, pkg.family),
+        // Internal HTTP handlers need the opaque storage id to stream exact ClawPack bytes.
+        ...(release.clawpackStorageId ? { clawpackStorageId: release.clawpackStorageId } : {}),
+      })),
     };
   },
 });
@@ -3319,7 +3323,11 @@ export const getVersionByNameForViewerInternal = internalQuery({
     if (!publicPackage) return null;
     return {
       package: publicPackage,
-      version: toPublicPackageRelease(release, pkg.family),
+      version: {
+        ...toPublicPackageRelease(release, pkg.family),
+        // Internal HTTP handlers need the opaque storage id to stream exact ClawPack bytes.
+        ...(release.clawpackStorageId ? { clawpackStorageId: release.clawpackStorageId } : {}),
+      },
     };
   },
 });
@@ -5051,6 +5059,7 @@ export const findPackagePublishResultInternal = internalQuery({
     name: v.string(),
     version: v.string(),
     integritySha256: v.string(),
+    clawpackSha256: v.optional(v.string()),
     ownerUserId: v.id("users"),
     ownerPublisherId: v.optional(v.id("publishers")),
   },
@@ -5064,7 +5073,14 @@ export const findPackagePublishResultInternal = internalQuery({
         q.eq("packageId", pkg._id).eq("version", args.version),
       )
       .unique();
-    if (!isPublishedPackageRelease(release) || release.integritySha256 !== args.integritySha256) {
+    const matchesExactClawArtifact =
+      pkg.family !== "claw" ||
+      (typeof args.clawpackSha256 === "string" && release?.clawpackSha256 === args.clawpackSha256);
+    if (
+      !isPublishedPackageRelease(release) ||
+      release.integritySha256 !== args.integritySha256 ||
+      !matchesExactClawArtifact
+    ) {
       return null;
     }
     return { ok: true as const, packageId: pkg._id, releaseId: release._id };
@@ -8272,6 +8288,28 @@ async function publishPackageImpl(
     throw new ConvexError(`Claw package name must use canonical form ${name}`);
   }
   const version = assertPackageVersion(family, payload.version);
+  if (family === "claw") {
+    if (payload.artifact?.kind !== "npm-pack") {
+      throw new ConvexError("Claw publication requires an already-built package tarball (.tgz)");
+    }
+    const expectedArtifactSha256 = payload.expectedArtifactSha256?.trim().toLowerCase();
+    if (!expectedArtifactSha256) {
+      throw new ConvexError("Claw publication requires expectedArtifactSha256");
+    }
+    if (!/^[a-f0-9]{64}$/.test(expectedArtifactSha256)) {
+      throw new ConvexError(
+        "Claw expectedArtifactSha256 must be a 64-character SHA-256 hex digest",
+      );
+    }
+    if (!/^[a-f0-9]{64}$/.test(payload.artifact.sha256)) {
+      throw new ConvexError("Claw artifact SHA-256 must be a 64-character lowercase hex digest");
+    }
+    if (expectedArtifactSha256 !== payload.artifact.sha256) {
+      throw new ConvexError(
+        `Claw artifact SHA-256 mismatch: expected ${expectedArtifactSha256}, got ${payload.artifact.sha256}`,
+      );
+    }
+  }
   const existingPackage = await runQueryRef<Doc<"packages"> | null>(
     ctx,
     internalRefs.packages.getPackageByNameInternal,
@@ -8720,6 +8758,8 @@ async function publishPackageImpl(
     clawManifestSummary: validatedClaw?.summary,
     source: effectiveSource,
   };
+  const publishedArtifactSha256 = family === "claw" ? packageInsertArgs.clawpackSha256 : undefined;
+  const attemptArtifactFingerprint = publishedArtifactSha256 ?? integritySha256;
 
   const inspectorFindings =
     inspectorResult?.warnings.map((finding) =>
@@ -8735,19 +8775,105 @@ async function publishPackageImpl(
         { packageId: existingPackage._id, version },
       );
     }
-    const existingAttempt = await runQueryRef<null | { attemptId: Id<"publishAttempts"> }>(
-      ctx,
-      internalRefs.publishAttempts.findExistingPublishAttemptForArtifactInternal,
-      {
-        kind: "package",
-        slug: name,
-        version,
-      },
-    );
+    const existingAttempt = await runQueryRef<null | {
+      attemptId: Id<"publishAttempts">;
+      status: string;
+      reusable: boolean;
+      packageId?: Id<"packages">;
+      releaseId?: Id<"packageReleases">;
+      result?: {
+        ok: true;
+        packageId: Id<"packages">;
+        releaseId: Id<"packageReleases">;
+      };
+    }>(ctx, internalRefs.publishAttempts.findExistingPublishAttemptForArtifactInternal, {
+      kind: "package",
+      slug: name,
+      version,
+      ...(family === "claw"
+        ? {
+            userId: actorUserId,
+            ownerUserId,
+            ownerPublisherId,
+            artifactFingerprint: attemptArtifactFingerprint,
+          }
+        : {}),
+    });
     if (existingAttempt) {
+      const reusableClawAttempt =
+        family === "claw" &&
+        existingAttempt.reusable &&
+        existingPackage !== null &&
+        !existingPackage.softDeletedAt &&
+        existingAttempt.packageId !== undefined &&
+        existingAttempt.packageId === existingPackage._id &&
+        existingAttempt.releaseId !== undefined &&
+        existingRelease !== null &&
+        existingAttempt.releaseId === existingRelease._id &&
+        !existingRelease.softDeletedAt &&
+        existingRelease.ownerDeletedAt === undefined &&
+        existingRelease.manualModeration?.state !== "quarantined" &&
+        existingRelease.manualModeration?.state !== "revoked" &&
+        resolvePackageReleaseScanStatus(existingRelease) !== "malicious" &&
+        (existingAttempt.status === "finalized"
+          ? isPublishedPackageRelease(existingRelease)
+          : existingRelease.publicationStatus === "pending");
+      if (reusableClawAttempt) {
+        if (existingAttempt.status === "finalized") {
+          if (!existingAttempt.result) {
+            throw new ConvexError("Finalized publish attempt is missing its package result.");
+          }
+          if (auth.kind === "github-actions") {
+            await runMutationRef(ctx, internalRefs.packagePublishTokens.revokeInternal, {
+              tokenId: auth.publishToken._id,
+            });
+          }
+          const finalizedResult = {
+            ...existingAttempt.result,
+            publicationStatus: "published" as const,
+            artifactSha256: publishedArtifactSha256,
+          };
+          return inspectorFindings.length > 0
+            ? { ...finalizedResult, inspectorFindings }
+            : finalizedResult;
+        }
+        if (auth.kind === "github-actions") {
+          await runMutationRef(ctx, internalRefs.packagePublishTokens.revokeInternal, {
+            tokenId: auth.publishToken._id,
+          });
+        }
+        return {
+          ok: true as const,
+          status: "pending" as const,
+          packageId: existingAttempt.packageId,
+          releaseId: existingAttempt.releaseId,
+          artifactSha256: publishedArtifactSha256,
+          publicationStatus: "pending" as const,
+          attemptId: existingAttempt.attemptId,
+          packageName: name,
+          version,
+          ...(inspectorFindings.length > 0 ? { inspectorFindings } : {}),
+        };
+      }
       throw new ConvexError(
         `Version ${version} already exists. Increment the version number and try again.`,
       );
+    }
+    if (family === "claw") {
+      const conflictingAttempt = await runQueryRef<null | { attemptId: Id<"publishAttempts"> }>(
+        ctx,
+        internalRefs.publishAttempts.findExistingPublishAttemptForArtifactInternal,
+        {
+          kind: "package",
+          slug: name,
+          version,
+        },
+      );
+      if (conflictingAttempt) {
+        throw new ConvexError(
+          `Version ${version} already exists. Increment the version number and try again.`,
+        );
+      }
     }
     if (existingPackage && existingRelease) {
       if (!existingRelease.softDeletedAt && existingRelease.publicationStatus === "pending") {
@@ -8796,9 +8922,9 @@ async function publishPackageImpl(
         ownerUserId,
         name,
         version,
-        integritySha256,
+        artifactFingerprint: attemptArtifactFingerprint,
       }),
-      artifactFingerprint: integritySha256,
+      artifactFingerprint: attemptArtifactFingerprint,
       files,
       clawpackStorageId: packageInsertArgs.clawpackStorageId,
       scanContext: buildPackagePublishAttemptScanContext(packageInsertArgs),
@@ -8856,6 +8982,7 @@ async function publishPackageImpl(
       const finalizedResult = {
         ...staged.result,
         publicationStatus: "published" as const,
+        ...(publishedArtifactSha256 ? { artifactSha256: publishedArtifactSha256 } : {}),
       };
       return inspectorFindings.length > 0
         ? { ...finalizedResult, inspectorFindings }
@@ -8867,6 +8994,7 @@ async function publishPackageImpl(
       status: "pending" as const,
       packageId: pendingResult.packageId,
       releaseId: pendingResult.releaseId,
+      ...(publishedArtifactSha256 ? { artifactSha256: publishedArtifactSha256 } : {}),
       publicationStatus: "pending" as const,
       attemptId: staged.attemptId,
       packageName: name,
@@ -8966,6 +9094,7 @@ async function publishPackageImpl(
   const publishedResult = {
     ...publishResult,
     publicationStatus: "published" as const,
+    ...(publishedArtifactSha256 ? { artifactSha256: publishedArtifactSha256 } : {}),
   };
   return inspectorFindings.length > 0 ? { ...publishedResult, inspectorFindings } : publishedResult;
 }
@@ -9011,6 +9140,14 @@ export const publishRelease: ReturnType<typeof action> = action({
     payload: v.any(),
   },
   handler: async (ctx, args) => {
+    if (
+      args.payload &&
+      typeof args.payload === "object" &&
+      !Array.isArray(args.payload) &&
+      (args.payload as Record<string, unknown>).family === "claw"
+    ) {
+      throw new ConvexError("Claw packages must use the exact-artifact HTTP publish flow");
+    }
     const { userId } = await requireUserFromAction(ctx);
     const stagePrePublicationChecks = stagedPrePublicationPublishesEnabled();
     return await publishPackageImpl(ctx, { kind: "user", actorUserId: userId }, args.payload, {
@@ -9071,6 +9208,7 @@ export const finalizePackagePublishAttemptInternal = internalAction({
         name?: string;
         version?: string;
         integritySha256?: string;
+        clawpackSha256?: string;
         ownerUserId?: Id<"users">;
         ownerPublisherId?: Id<"publishers">;
       };
@@ -9087,6 +9225,7 @@ export const finalizePackagePublishAttemptInternal = internalAction({
               name: insertArgs.name,
               version: insertArgs.version,
               integritySha256: insertArgs.integritySha256,
+              clawpackSha256: insertArgs.clawpackSha256,
               ownerUserId: insertArgs.ownerUserId,
               ownerPublisherId: insertArgs.ownerPublisherId,
             })
@@ -9184,7 +9323,7 @@ function buildPackagePublishAttemptIdempotencyKey(args: {
   ownerPublisherId?: Id<"publishers">;
   name: string;
   version: string;
-  integritySha256: string;
+  artifactFingerprint: string;
 }) {
   return [
     "package",
@@ -9192,7 +9331,7 @@ function buildPackagePublishAttemptIdempotencyKey(args: {
     args.ownerPublisherId ?? args.ownerUserId,
     args.name,
     args.version,
-    args.integritySha256,
+    args.artifactFingerprint,
   ].join(":");
 }
 
@@ -11186,10 +11325,28 @@ export const insertReleaseInternal = internalMutation({
         )
         .unique();
       if (releaseExists) {
+        const matchesExactClawArtifact =
+          args.family !== "claw" ||
+          (typeof args.clawpackSha256 === "string" &&
+            releaseExists.clawpackSha256 === args.clawpackSha256);
+        const matchesExistingOwner =
+          args.ownerPublisherId !== undefined
+            ? existing.ownerPublisherId === args.ownerPublisherId
+            : existing.ownerPublisherId === undefined && existing.ownerUserId === args.ownerUserId;
+        const allowExactClawRetry =
+          args.family === "claw" && matchesExistingOwner && matchesExactClawArtifact;
+        const canReuseExistingRelease =
+          args.allowExistingRelease ||
+          (allowExactClawRetry &&
+            isPublishedPackageRelease(releaseExists) &&
+            releaseExists.manualModeration?.state !== "quarantined" &&
+            releaseExists.manualModeration?.state !== "revoked" &&
+            resolvePackageReleaseScanStatus(releaseExists) !== "malicious");
         if (
-          args.allowExistingRelease &&
+          canReuseExistingRelease &&
           !releaseExists.softDeletedAt &&
-          releaseExists.integritySha256 === args.integritySha256
+          releaseExists.integritySha256 === args.integritySha256 &&
+          matchesExactClawArtifact
         ) {
           return {
             ok: true as const,
