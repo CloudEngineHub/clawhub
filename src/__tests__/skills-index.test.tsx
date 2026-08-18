@@ -1050,6 +1050,40 @@ describe("SkillsIndex", () => {
     expect(screen.getByRole("button", { name: "Load more" })).toBeTruthy();
   });
 
+  it.each(["new", "featured", "official"] as const)(
+    "keeps the %s first page retryable after a temporary fetch failure",
+    async (tab) => {
+      searchMock = { tab };
+      vi.stubGlobal("IntersectionObserver", undefined);
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        convexHttpMock.query
+          .mockRejectedValueOnce(new Error("temporary failure"))
+          .mockResolvedValueOnce({
+            page: [makeListResult("recovered-skill", "Recovered Skill")],
+            hasMore: false,
+            nextCursor: null,
+          });
+
+        render(<SkillsIndex />);
+        await act(async () => {});
+
+        expect(screen.queryByText("No skills found")).toBeNull();
+        expect(screen.getByRole("button", { name: "Load more" })).toBeTruthy();
+
+        await act(async () => {
+          fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+        });
+
+        expect(convexHttpMock.query).toHaveBeenCalledTimes(2);
+        expect(screen.getByText("Recovered Skill")).toBeTruthy();
+        expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+      } finally {
+        consoleErrorSpy.mockRestore();
+      }
+    },
+  );
+
   it("keeps loading across empty filtered pages without flashing terminal states", async () => {
     class IntersectionObserverMock {
       observe = vi.fn();
