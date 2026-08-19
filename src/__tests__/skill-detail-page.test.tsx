@@ -307,6 +307,148 @@ describe("SkillDetailPage", () => {
     expect(versionCalls.every(([, args]) => args === "skip")).toBe(true);
   });
 
+  it("shows Evals only for a completed result on the current NVIDIA version", () => {
+    useQueryMock.mockImplementation((query: unknown, args: unknown) => {
+      if (args === "skip") return undefined;
+      if (getFunctionName(query as never) === "skillEvaluations:getCurrentForSkill") {
+        return {
+          source: {
+            repository: "nvidia/skills",
+            commit: "0a78f333a1d67c837fbf4288efe6488169dc7140",
+            path: "skills/doca-dpa",
+            contentHash: "content-hash",
+          },
+          evaluator: {
+            repository: "NVIDIA/SkillEvaluator",
+            release: "v0.1.0",
+            commit: "4975c97d49e3623eeab739248e52d83c4aa8f582",
+            agent: "codex",
+            agentModel: "gpt-5.6",
+            judgeProvider: "openai",
+            judgeModel: "gpt-5.4",
+            environment: "docker",
+            attempts: 2,
+          },
+          metrics: {
+            sampleCount: 8,
+            overall: { withSkill: 0.9, withoutSkill: 0.6, delta: 0.3 },
+            cases: {
+              withSkillPassed: 4,
+              withSkillTotal: 4,
+              withoutSkillPassed: 2,
+              withoutSkillTotal: 4,
+            },
+            dimensions: [
+              { id: "security", withSkill: 1, withoutSkill: 1, delta: 0 },
+              { id: "correctness", withSkill: 0.9, withoutSkill: 0.6, delta: 0.3 },
+            ],
+          },
+          completedAt: Date.parse("2026-08-18T00:00:00Z"),
+        };
+      }
+      if (args && typeof args === "object" && "slug" in args) {
+        return {
+          skill: {
+            _id: skillId,
+            _creationTime: 0,
+            slug: "doca-dpa",
+            displayName: "DOCA DPA",
+            summary: "Build NVIDIA DOCA DPA applications.",
+            ownerUserId: ownerId,
+            ownerPublisherId,
+            installKind: "github",
+            githubCurrentRepo: "NVIDIA/skills",
+            githubCurrentCommit: "0a78f333a1d67c837fbf4288efe6488169dc7140",
+            githubPath: "skills/doca-dpa",
+            tags: {},
+            badges: {},
+            stats: { stars: 0, downloads: 0, installs: 0, versions: 0, comments: 0 },
+            createdAt: 0,
+            updatedAt: 0,
+          },
+          owner: {
+            _id: ownerPublisherId,
+            _creationTime: 0,
+            kind: "user",
+            handle: "nvidia",
+            displayName: "NVIDIA",
+            linkedUserId: ownerId,
+          },
+          latestVersion: null,
+          forkOf: null,
+          canonical: null,
+        };
+      }
+      return undefined;
+    });
+
+    render(<SkillDetailPage slug="doca-dpa" canonicalOwner="nvidia" />);
+
+    expect(getDesktopSkillTabs().getByRole("tab", { name: "Evals" })).toBeTruthy();
+  });
+
+  it("hides Evals when the current skill version has no completed result", () => {
+    render(<SkillDetailPage slug="github-skill" initialData={makeInitialData(true)} />);
+
+    expect(getDesktopSkillTabs().queryByRole("tab", { name: "Evals" })).toBeNull();
+  });
+
+  it("opens an evaluation deep link after its result finishes loading", async () => {
+    window.location.hash = "#evaluation";
+    let evaluationResult: Record<string, unknown> | undefined;
+    useQueryMock.mockImplementation((query: unknown, args: unknown) => {
+      if (args === "skip") return undefined;
+      if (getFunctionName(query as never) === "skillEvaluations:getCurrentForSkill") {
+        return evaluationResult;
+      }
+      return undefined;
+    });
+    const page = <SkillDetailPage slug="github-skill" initialData={makeInitialData(true)} />;
+    const { rerender } = render(page);
+
+    expect(getDesktopSkillTabs().queryByRole("tab", { name: "Evals" })).toBeNull();
+
+    evaluationResult = {
+      source: {
+        repository: "nvidia/skills",
+        commit: "0a78f333a1d67c837fbf4288efe6488169dc7140",
+        path: "skills/doca-dpa",
+        contentHash: "content-hash",
+      },
+      evaluator: {
+        repository: "NVIDIA/SkillEvaluator",
+        release: "v0.1.0",
+        commit: "4975c97d49e3623eeab739248e52d83c4aa8f582",
+        agent: "codex",
+        agentModel: "gpt-5.6",
+        judgeProvider: "openai",
+        judgeModel: "gpt-5.4",
+        environment: "docker",
+        attempts: 2,
+      },
+      metrics: {
+        sampleCount: 8,
+        overall: { withSkill: 0.9, withoutSkill: 0.6, delta: 0.3 },
+        cases: {
+          withSkillPassed: 4,
+          withSkillTotal: 4,
+          withoutSkillPassed: 2,
+          withoutSkillTotal: 4,
+        },
+        dimensions: [],
+      },
+      completedAt: Date.parse("2026-08-18T00:00:00Z"),
+    };
+    rerender(page);
+
+    await waitFor(() =>
+      expect(
+        getDesktopSkillTabs().getByRole("tab", { name: "Evals" }).getAttribute("aria-selected"),
+      ).toBe("true"),
+    );
+    expect(screen.getByRole("tabpanel", { name: "Evals" })).toBeTruthy();
+  });
+
   it("keeps loader-backed skill content visible while staff live query resolves", async () => {
     useAuthStatusMock.mockReturnValue({
       isAuthenticated: true,

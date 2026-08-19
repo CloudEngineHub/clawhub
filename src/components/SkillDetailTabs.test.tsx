@@ -1,6 +1,6 @@
 /* @vitest-environment jsdom */
 
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import type { ClawdisSkillMetadata } from "clawhub-schema";
 import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -75,6 +75,60 @@ function renderReadmeForOwner(readmeContent: string) {
 }
 
 describe("SkillDetailTabs README links", () => {
+  it("uses the shared skeleton while tab content loads", () => {
+    const { rerender } = render(
+      <SkillDetailTabs
+        activeTab="readme"
+        setActiveTab={vi.fn()}
+        readmeContent={null}
+        readmeError={null}
+        skillCardContent={null}
+        skillCardError={null}
+        hasSkillCard={true}
+        latestFiles={[]}
+        latestVersionId={null}
+        skill={{ slug: "api-gateway", tags: {} } as Doc<"skills">}
+        onCompareIntent={vi.fn()}
+        diffVersions={undefined}
+        versions={undefined}
+        nixPlugin={false}
+        suppressVersionScanResults={false}
+        scanResultsSuppressedMessage={null}
+        clawdis={undefined}
+        osLabels={[]}
+      />,
+    );
+
+    expect(screen.getByRole("status", { name: "Loading tab content" })).toBeTruthy();
+    expect(screen.queryByText(/Loading README/i)).toBeNull();
+
+    rerender(
+      <SkillDetailTabs
+        activeTab="skill-card"
+        setActiveTab={vi.fn()}
+        readmeContent={null}
+        readmeError={null}
+        skillCardContent={null}
+        skillCardError={null}
+        hasSkillCard={true}
+        latestFiles={[]}
+        latestVersionId={null}
+        skill={{ slug: "api-gateway", tags: {} } as Doc<"skills">}
+        onCompareIntent={vi.fn()}
+        diffVersions={undefined}
+        versions={undefined}
+        nixPlugin={false}
+        suppressVersionScanResults={false}
+        scanResultsSuppressedMessage={null}
+        clawdis={undefined}
+        osLabels={[]}
+      />,
+    );
+
+    expect(screen.getByRole("status", { name: "Loading tab content" })).toBeTruthy();
+    expect(screen.queryByText(/Loading Skill Card/i)).toBeNull();
+  });
+
   it("renders files and version history tabs before install metadata tabs", () => {
     renderReadme("# API Gateway");
 
@@ -369,5 +423,59 @@ describe("SkillDetailTabs README links", () => {
     expect(screen.getByText(/line one/)).toBeTruthy();
     expect(screen.getByText(/line two/)).toBeTruthy();
     expect(screen.queryByText(/<br/i)).toBeNull();
+  });
+});
+
+describe("SkillDetailTabs evaluation tab", () => {
+  it("opens a dedicated evaluation panel without replacing the existing tabs", () => {
+    function TestTabs() {
+      const [activeTab, setActiveTab] = useState<DetailTab>("readme");
+      return (
+        <SkillDetailTabs
+          activeTab={activeTab}
+          setActiveTab={setActiveTab}
+          onCompareIntent={vi.fn()}
+          readmeContent="# Demo"
+          readmeError={null}
+          skillCardContent="# Skill Card"
+          skillCardError={null}
+          hasSkillCard={true}
+          latestFiles={[]}
+          latestVersionId={null}
+          skill={
+            {
+              _id: "skills:demo",
+              slug: "demo",
+              displayName: "Demo",
+              tags: {},
+            } as unknown as Doc<"skills">
+          }
+          diffVersions={undefined}
+          versions={undefined}
+          nixPlugin={false}
+          showArchiveTabs={false}
+          suppressVersionScanResults={false}
+          scanResultsSuppressedMessage={null}
+          clawdis={undefined}
+          osLabels={[]}
+          evaluationContent={<div>Native SkillEvaluator report</div>}
+        />
+      );
+    }
+
+    render(<TestTabs />);
+    const tablist = screen.getByRole("tablist", { name: "Skill detail tabs" });
+    expect(
+      within(tablist)
+        .getAllByRole("tab")
+        .map((tab) => tab.textContent),
+    ).toEqual(["SKILL.md", "Evals", "Skill Card"]);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Evals" }));
+
+    expect(screen.getByRole("tabpanel", { name: "Evals" }).textContent).toContain(
+      "Native SkillEvaluator report",
+    );
+    expect(screen.getByRole("tab", { name: "SKILL.md" })).toBeTruthy();
   });
 });

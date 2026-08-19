@@ -10976,6 +10976,187 @@ a.skills-sh-security-audit-row:focus-visible {
   gap: var(--space-5);
 }
 
+.skill-evaluation-tab-body {
+  padding: 0;
+  overflow: hidden;
+}
+
+.skill-evaluation-report {
+  display: grid;
+  gap: var(--space-5);
+  min-width: 0;
+  padding: var(--space-5);
+}
+
+.skill-evaluation-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-5);
+}
+
+.skill-evaluation-header h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: var(--fs-xl);
+}
+
+.skill-evaluation-header p {
+  max-width: 72ch;
+  margin: var(--space-2) 0 0;
+  color: var(--ink-soft);
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+}
+
+.skill-evaluation-overview,
+.skill-evaluation-metrics {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.skill-evaluation-overview h3,
+.skill-evaluation-section-heading h3 {
+  margin: 0;
+  color: var(--ink);
+  font-size: var(--fs-md);
+}
+
+.skill-evaluation-overview-list {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  color: var(--ink);
+  font-size: var(--fs-sm);
+  list-style: none;
+}
+
+.skill-evaluation-overview-list > div {
+  display: grid;
+  grid-template-columns: minmax(104px, 0.2fr) minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: baseline;
+}
+
+.skill-evaluation-overview-list dt {
+  color: var(--ink-soft);
+  font-weight: 650;
+}
+
+.skill-evaluation-overview-list dd {
+  min-width: 0;
+  margin: 0;
+}
+
+.skill-evaluation-overview-list a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.skill-tab-skeleton {
+  display: grid;
+  gap: var(--space-5);
+  min-height: 320px;
+  padding: var(--space-2) 0;
+}
+
+.skill-tab-skeleton-title {
+  width: min(220px, 42%);
+  height: 28px;
+}
+
+.skill-tab-skeleton-copy {
+  display: grid;
+  gap: var(--space-3);
+  width: 100%;
+}
+
+.skill-tab-skeleton-copy > span {
+  width: 100%;
+  height: 14px;
+}
+
+.skill-tab-skeleton-copy > span:nth-child(2) {
+  width: 92%;
+}
+
+.skill-tab-skeleton-copy > span:nth-child(3) {
+  width: 76%;
+}
+
+.skill-tab-skeleton-copy > span:nth-child(4) {
+  width: 88%;
+}
+
+.skill-tab-skeleton-copy > span:nth-child(5) {
+  width: 64%;
+}
+
+.skill-evaluation-section-heading p {
+  margin: var(--space-1) 0 0;
+  color: var(--ink-soft);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+
+.skill-evaluation-table-wrap {
+  overflow-x: auto;
+  border: 1px solid color-mix(in srgb, var(--line) 82%, transparent);
+  border-radius: var(--r-md);
+}
+
+.skill-evaluation-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+
+.skill-evaluation-table th,
+.skill-evaluation-table td {
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid color-mix(in srgb, var(--line) 72%, transparent);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.skill-evaluation-table th:first-child {
+  text-align: left;
+}
+
+.skill-evaluation-table thead th {
+  color: var(--ink-soft);
+  font-size: var(--fs-xs);
+  font-weight: 650;
+}
+
+.skill-evaluation-table tbody th {
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.skill-evaluation-table td {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.skill-evaluation-table td.is-positive {
+  color: var(--status-success-fg);
+  font-weight: 700;
+}
+
+@media (max-width: 900px) {
+  .skill-evaluation-report {
+    padding: 0;
+  }
+
+  .skill-evaluation-header {
+    display: grid;
+  }
+}
+
 .skill-card-document {
   display: grid;
   gap: var(--space-5);

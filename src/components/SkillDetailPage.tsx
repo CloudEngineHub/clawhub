@@ -40,6 +40,7 @@ import {
   formatOsList,
   stripFrontmatter,
 } from "./skillDetailUtils";
+import { SkillEvaluationReport, type SkillEvaluationResult } from "./SkillEvaluationReport";
 import { buildSkillInstallTabs } from "./SkillInstallCard";
 import { SkillOwnershipPanel } from "./SkillOwnershipPanel";
 import { SkillPublishSuccessDialog } from "./SkillPublishSuccessDialog";
@@ -72,6 +73,7 @@ function tabFromHash(hash: string): DetailTab {
   const normalized = hash.replace(/^#/, "").toLowerCase();
   if (normalized === "files") return "files";
   if (normalized === "skill-card" || normalized === "card") return "skill-card";
+  if (normalized === "evaluation") return "evaluation";
   if (normalized === "compare" || normalized === "diff") return "compare";
   if (normalized === "versions") return "versions";
   if (
@@ -258,6 +260,10 @@ export function SkillDetailPage({
   const latestVersionId = latestVersion?._id ?? null;
   const githubBackedFields = skill as GitHubBackedSkillFields | null | undefined;
   const isGitHubBackedSkill = githubBackedFields?.installKind === "github" && !latestVersionId;
+  const skillEvaluation = useQuery(
+    api.skillEvaluations.getCurrentForSkill,
+    skill ? { skillId: skill._id } : "skip",
+  ) as SkillEvaluationResult | null | undefined;
   const modInfo = result?.moderationInfo ?? null;
   const relatedCategory = useMemo(() => (skill ? getSkillCategoryForSkill(skill) : null), [skill]);
   const relatedCategories = useMemo(
@@ -553,9 +559,10 @@ export function SkillDetailPage({
       ? ["readme"]
       : ["readme", "files", "versions"];
     if (hasSkillCard) baseTabs.splice(1, 0, "skill-card");
+    if (skillEvaluation) baseTabs.push("evaluation");
     if (!isGitHubBackedSkill && (versions?.length ?? 0) > 1) baseTabs.push("compare");
     return new Set([...baseTabs, ...installTabs.map((t) => t.id)]);
-  }, [clawdis, hasSkillCard, isGitHubBackedSkill, osLabels, versions]);
+  }, [clawdis, hasSkillCard, isGitHubBackedSkill, osLabels, skillEvaluation, versions]);
 
   useEffect(() => {
     setActiveTab((prev) => {
@@ -991,6 +998,9 @@ export function SkillDetailPage({
         clawdis={clawdis}
         osLabels={osLabels}
         readmeHrefResolver={readmeHrefResolver}
+        evaluationContent={
+          skillEvaluation ? <SkillEvaluationReport result={skillEvaluation} /> : undefined
+        }
       />
       <SkillRelatedSection
         category={relatedCategory}

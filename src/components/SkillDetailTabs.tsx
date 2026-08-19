@@ -1,5 +1,5 @@
 import type { ClawdisSkillMetadata } from "clawhub-schema";
-import { lazy, Suspense, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState, type ReactNode } from "react";
 import { defaultUrlTransform } from "react-markdown";
 import type { Doc, Id } from "../../convex/_generated/dataModel";
 import { resolveSkillReadmeHref } from "../lib/skillReadmeLinks";
@@ -19,51 +19,16 @@ const SkillFilesPanel = lazy(() =>
 
 const README_COLLAPSED_LINE_COUNT = 50;
 
-function SkillDiffSkeleton() {
+function SkillTabSkeleton() {
   return (
-    <div className="skill-diff-skeleton" role="status" aria-label="Loading diff viewer">
-      <div className="diff-skeleton-toolbar">
-        <div className="diff-skeleton-version-row">
-          <div className="diff-skeleton-field">
-            <Skeleton className="diff-skeleton-label" />
-            <Skeleton className="diff-skeleton-control" />
-          </div>
-          <Skeleton className="diff-skeleton-swap" />
-          <div className="diff-skeleton-field">
-            <Skeleton className="diff-skeleton-label" />
-            <Skeleton className="diff-skeleton-control" />
-          </div>
-        </div>
-        <div className="diff-skeleton-field diff-skeleton-view">
-          <Skeleton className="diff-skeleton-label diff-skeleton-label-short" />
-          <Skeleton className="diff-skeleton-toggle" />
-        </div>
-      </div>
-      <div className="diff-skeleton-file-bar">
-        <Skeleton className="diff-skeleton-arrow" />
-        <Skeleton className="diff-skeleton-file-select" />
-        <Skeleton className="diff-skeleton-arrow" />
-        <Skeleton className="diff-skeleton-badge" />
-        <Skeleton className="diff-skeleton-count" />
-      </div>
-      <div className="diff-skeleton-editor">
-        <div className="diff-skeleton-gutter" aria-hidden="true">
-          <Skeleton />
-          <Skeleton />
-          <Skeleton />
-          <Skeleton />
-          <Skeleton />
-          <Skeleton />
-        </div>
-        <div className="diff-skeleton-code" aria-hidden="true">
-          <Skeleton className="w-[18%]" />
-          <Skeleton className="w-[58%]" />
-          <Skeleton className="w-[82%]" />
-          <Skeleton className="w-[72%]" />
-          <Skeleton className="mt-4 w-[34%]" />
-          <Skeleton className="w-[66%]" />
-          <Skeleton className="w-[48%]" />
-        </div>
+    <div className="skill-tab-skeleton" role="status" aria-label="Loading tab content">
+      <Skeleton className="skill-tab-skeleton-title" />
+      <div className="skill-tab-skeleton-copy" aria-hidden="true">
+        <Skeleton />
+        <Skeleton />
+        <Skeleton />
+        <Skeleton />
+        <Skeleton />
       </div>
     </div>
   );
@@ -74,6 +39,7 @@ type SkillFile = Doc<"skillVersions">["files"][number];
 export type DetailTab =
   | "readme"
   | "skill-card"
+  | "evaluation"
   | "files"
   | "compare"
   | "versions"
@@ -103,6 +69,7 @@ type SkillDetailTabsProps = {
   clawdis: ClawdisSkillMetadata | undefined;
   osLabels: string[];
   readmeHrefResolver?: (href: string) => string;
+  evaluationContent?: ReactNode;
 };
 
 export function SkillDetailTabs({
@@ -129,6 +96,7 @@ export function SkillDetailTabs({
   clawdis,
   osLabels,
   readmeHrefResolver,
+  evaluationContent,
 }: SkillDetailTabsProps) {
   const resolveReadmeHref =
     readmeHrefResolver ?? ((href: string) => resolveSkillReadmeHref(href, skill.slug, ownerHandle));
@@ -177,6 +145,19 @@ export function SkillDetailTabs({
         >
           SKILL.md
         </button>
+        {evaluationContent ? (
+          <button
+            id="skill-tab-evaluation"
+            className={`tab-button${activeTab === "evaluation" ? " is-active" : ""}`}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "evaluation"}
+            aria-controls="skill-tabpanel-evaluation"
+            onClick={() => selectTab("evaluation")}
+          >
+            Evals
+          </button>
+        ) : null}
         {hasSkillCard ? (
           <button
             id="skill-tab-skill-card"
@@ -293,7 +274,7 @@ export function SkillDetailTabs({
               <p className="empty-state-body">This skill doesn't have a SKILL.md file yet.</p>
             </div>
           ) : (
-            <div className="stat p-4">Loading README...</div>
+            <SkillTabSkeleton />
           )}
         </div>
       ) : null}
@@ -305,38 +286,61 @@ export function SkillDetailTabs({
           id="skill-tabpanel-skill-card"
           aria-labelledby="skill-tab-skill-card"
         >
-          <details className="skill-card-info-callout" open>
-            <summary>About Skill Cards</summary>
-            <p>
-              Skill Cards follow{" "}
-              <a href="https://docs.nvidia.com/skills/skill-cards" target="_blank" rel="noreferrer">
-                NVIDIA&apos;s trust-card pattern for agent skills
-              </a>
-              , giving a compact release record of what a skill does, who published it, and what
-              risks or limits to review before use.
-            </p>
-          </details>
           {skillCardContent ? (
-            <SkillCardPreview
-              content={skillCardContent}
-              urlTransform={(url, key) =>
-                key === "href" ? resolveReadmeHref(url) : defaultUrlTransform(url)
-              }
-            />
+            <>
+              <details className="skill-card-info-callout" open>
+                <summary>About Skill Cards</summary>
+                <p>
+                  Skill Cards follow{" "}
+                  <a
+                    href="https://docs.nvidia.com/skills/skill-cards"
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    NVIDIA&apos;s trust-card pattern for agent skills
+                  </a>
+                  , giving a compact release record of what a skill does, who published it, and what
+                  risks or limits to review before use.
+                </p>
+              </details>
+              <SkillCardPreview
+                content={skillCardContent}
+                urlTransform={(url, key) =>
+                  key === "href" ? resolveReadmeHref(url) : defaultUrlTransform(url)
+                }
+              />
+            </>
           ) : skillCardError ? (
             <div className="empty-state px-[var(--space-4)] py-[var(--space-6)]">
               <p className="empty-state-title">No Skill Card available</p>
               <p className="empty-state-body">The generated skill-card.md file is not available.</p>
             </div>
           ) : (
-            <div className="stat p-4">Loading Skill Card...</div>
+            <SkillTabSkeleton />
           )}
+        </div>
+      ) : null}
+
+      {evaluationContent && activeTab === "evaluation" ? (
+        <div
+          className="tab-body skill-evaluation-tab-body"
+          role="tabpanel"
+          id="skill-tabpanel-evaluation"
+          aria-labelledby="skill-tab-evaluation"
+        >
+          {evaluationContent}
         </div>
       ) : null}
 
       {showArchiveTabs && activeTab === "files" ? (
         <div role="tabpanel" id="skill-tabpanel-files" aria-labelledby="skill-tab-files">
-          <Suspense fallback={<div className="tab-body stat">Loading file viewer...</div>}>
+          <Suspense
+            fallback={
+              <div className="tab-body">
+                <SkillTabSkeleton />
+              </div>
+            }
+          >
             <SkillFilesPanel
               versionId={latestVersionId}
               version={latestVersion ?? null}
@@ -356,9 +360,9 @@ export function SkillDetailTabs({
           aria-labelledby="skill-tab-compare"
         >
           {diffVersions === undefined ? (
-            <SkillDiffSkeleton />
+            <SkillTabSkeleton />
           ) : (
-            <Suspense fallback={<SkillDiffSkeleton />}>
+            <Suspense fallback={<SkillTabSkeleton />}>
               <SkillDiffCard skill={skill} versions={diffVersions} variant="embedded" />
             </Suspense>
           )}
