@@ -24,6 +24,7 @@ const FIXED_ZIP_DATE = new Date(1980, 0, 1, 0, 0, 0);
 // Storage response chunk boundaries vary with transport backpressure; normalize
 // them so identical files still produce byte-for-byte identical archives.
 const ZIP_INPUT_CHUNK_BYTES = 64 * 1024;
+const MAX_EXPORT_ARCHIVE_PATH_JSON_BYTES = 900;
 
 // ==================== Zip Slip Protection ====================
 
@@ -38,7 +39,21 @@ export function validateSlug(slug: string): boolean {
 
 /** Validate file path against Zip Slip — rejects absolute paths, `..`, backslashes, and empty segments. */
 export function validateFilePath(filePath: string): boolean {
-  if (!filePath || filePath.length > 500) return false;
+  return validateZipPath(filePath, 500);
+}
+
+/** Validate a namespaced bulk-export path (publisher + slug + stored file path). */
+export function validateExportArchivePath(filePath: string): boolean {
+  if (!validateZipPath(filePath, 900)) return false;
+  // The path is repeated in the signed JSON handoff. Bound its encoded form,
+  // not UTF-16 code units, so multibyte and escaped names cannot overflow the
+  // manifest budget while still passing the character-count guard.
+  const encodedJsonBytes = new TextEncoder().encode(JSON.stringify(filePath)).byteLength - 2;
+  return encodedJsonBytes <= MAX_EXPORT_ARCHIVE_PATH_JSON_BYTES;
+}
+
+function validateZipPath(filePath: string, maxLength: number): boolean {
+  if (!filePath || filePath.length > maxLength) return false;
   if (filePath.startsWith("/")) return false;
   if (filePath.includes("\\")) return false;
   const segments = filePath.split("/");
@@ -77,7 +92,36 @@ export function buildDeterministicZip(entries: ZipEntry[], meta?: SkillZipMeta) 
 }
 
 export function buildDeterministicZipStream(entries: AsyncZipEntry[], meta?: SkillZipMeta) {
-  const orderedEntries = orderZipEntries(entries, meta);
+  return buildOrderedZipStream(orderZipEntries(entries, meta));
+}
+
+export function buildMergedExportZipStream(
+  entries: AsyncZipEntry[],
+  manifest: MergedExportManifestEntry[],
+) {
+  const sorted = [...entries].sort((a, b) => a.path.localeCompare(b.path));
+  const seenPaths = new Set<string>();
+  for (const entry of sorted) {
+    if (seenPaths.has(entry.path)) {
+      throw new Error(`Duplicate ZIP path detected: "${entry.path}"`);
+    }
+    seenPaths.add(entry.path);
+  }
+  const manifestPath = "_manifest.json";
+  if (seenPaths.has(manifestPath)) {
+    throw new Error(`Duplicate ZIP path detected: "${manifestPath}" (conflicts with manifest)`);
+  }
+  const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest, null, 2));
+  return buildOrderedZipStream([
+    ...sorted,
+    {
+      path: manifestPath,
+      openStream: async () => bytesToStream(manifestBytes),
+    },
+  ]);
+}
+
+function buildOrderedZipStream(orderedEntries: AsyncZipEntry[]) {
   const output: Uint8Array[] = [];
   let entryIndex = 0;
   let current:
@@ -200,6 +244,15 @@ export function buildDeterministicZipStream(entries: AsyncZipEntry[], meta?: Ski
   );
 }
 
+function bytesToStream(bytes: Uint8Array) {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
 function orderZipEntries(entries: AsyncZipEntry[], meta?: SkillZipMeta) {
   const sorted = [...entries].sort((a, b) => a.path.localeCompare(b.path));
   const byPath = new Map(sorted.map((entry) => [entry.path, entry]));
@@ -210,13 +263,7 @@ function orderZipEntries(entries: AsyncZipEntry[], meta?: SkillZipMeta) {
     const metaBytes = new TextEncoder().encode(JSON.stringify(buildSkillMeta(meta), null, 2));
     byPath.set("_meta.json", {
       path: "_meta.json",
-      openStream: async () =>
-        new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(metaBytes);
-            controller.close();
-          },
-        }),
+      openStream: async () => bytesToStream(metaBytes),
     });
     zipDataOrder["_meta.json"] = true;
   }
