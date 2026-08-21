@@ -124,7 +124,13 @@ function isTerminalFinalizationConflict(error: string | undefined) {
       error.includes("Slug redirects to an existing skill. Choose a different slug.") ||
       error.includes("Upstream skill not found") ||
       error.includes("Pending skill version not found.") ||
-      error.includes("Pending package release not found"))
+      error.includes("Pending package release not found") ||
+      error.includes("Staged OpenClaw publish authorization token is missing") ||
+      error.includes("Staged OpenClaw publish authorization no longer matches the release") ||
+      error.includes(
+        "Trusted publish authorization no longer matches the current trusted publisher",
+      ) ||
+      error.includes("OpenClaw release parent terminal state"))
   );
 }
 

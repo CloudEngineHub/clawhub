@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ci, pluginRoot, reports } from "@openclaw/plugin-inspector";
 import ignore from "ignore";
 import mime from "mime";
@@ -54,6 +55,7 @@ import {
   validateOpenClawExternalCodePluginPackageContents,
   validateOpenClawExternalCodePluginPackageJson,
 } from "../../schema/index.js";
+import { buildGitHubFolderContentHash, hashSkillFiles } from "../../skills.js";
 import { getOptionalAuthToken, requireAuthToken } from "../authToken.js";
 import { getRegistry } from "../registry.js";
 import { titleCase } from "../slug.js";
@@ -177,6 +179,7 @@ type PackagePublishOptions = {
 
 type PackagePublishRuntime = {
   now?: () => number;
+  revalidateTrustedTooling?: () => Promise<void> | void;
   sleep?: (milliseconds: number) => Promise<void>;
 };
 
@@ -996,13 +999,22 @@ export async function cmdPublishPackage(
       ? null
       : createCrabLoader(`Preparing ${plan.payload.name}@${plan.payload.version}`);
     try {
-      let publishToken = await resolvePackagePublishToken({
+      const revalidateTrustedTooling =
+        runtime.revalidateTrustedTooling ?? revalidateTrustedToolingIdentityAtMutationBoundary;
+      const trustedToolingBoundary =
+        runtime.revalidateTrustedTooling !== undefined ||
+        Boolean(process.env.TRUSTED_TOOLING_IDENTITY_JSON?.trim());
+      const inventoryDigest = buildGitHubFolderContentHash(hashSkillFiles(plan.filesOnDisk).files);
+      let resolvedPublishToken = await resolvePackagePublishToken({
         registry,
         packageName: plan.payload.name,
         version: plan.payload.version,
+        scope: "upload",
+        inventoryDigest,
         manualOverrideReason: plan.payload.manualOverrideReason,
         spinner,
       });
+      let publishToken = resolvedPublishToken.token;
       await validateClawPublishProfilePolicy(plan, registry, publishToken);
       const form = new FormData();
       const payloadJson = JSON.stringify(plan.payload);
@@ -1015,6 +1027,8 @@ export async function cmdPublishPackage(
             publishToken,
             plan.clawpackOnDisk,
             spinner,
+            revalidateTrustedTooling,
+            trustedToolingBoundary,
           );
           form.set("clawpack", staged.storageId);
           form.set("clawpackUploadTicket", staged.uploadTicket);
@@ -1040,6 +1054,19 @@ export async function cmdPublishPackage(
       }
 
       if (spinner) spinner.text = `Publishing ${plan.payload.name}@${plan.payload.version}`;
+      await revalidateTrustedTooling();
+      if (resolvedPublishToken.kind === "github-actions") {
+        resolvedPublishToken = await resolvePackagePublishToken({
+          registry,
+          packageName: plan.payload.name,
+          version: plan.payload.version,
+          scope: "publish",
+          inventoryDigest,
+          manualOverrideReason: plan.payload.manualOverrideReason,
+          spinner,
+        });
+        publishToken = resolvedPublishToken.token;
+      }
       const result = await apiRequestForm(
         registry,
         {
@@ -1047,7 +1074,7 @@ export async function cmdPublishPackage(
           path: ApiRoutes.packages,
           token: publishToken,
           form,
-          retryCount: PACKAGE_PUBLISH_RETRY_COUNT,
+          retryCount: trustedToolingBoundary ? 0 : PACKAGE_PUBLISH_RETRY_COUNT,
         },
         ApiV1PackagePublishResponseSchema,
       );
@@ -1073,13 +1100,17 @@ export async function cmdPublishPackage(
           spinner,
           runtime,
           refreshPublishToken: async () => {
-            publishToken = await resolvePackagePublishToken({
-              registry,
-              packageName,
-              version,
-              manualOverrideReason,
-              spinner,
-            });
+            publishToken = (
+              await resolvePackagePublishToken({
+                registry,
+                packageName,
+                version,
+                scope: "publish",
+                inventoryDigest,
+                manualOverrideReason,
+                spinner,
+              })
+            ).token;
             return publishToken;
           },
         });
@@ -1132,6 +1163,23 @@ export async function cmdPublishPackage(
   } finally {
     await plan?.cleanup?.();
   }
+}
+
+function revalidateTrustedToolingIdentityAtMutationBoundary() {
+  if (!process.env.TRUSTED_TOOLING_IDENTITY_JSON?.trim()) return;
+
+  const verifierPath = fileURLToPath(
+    new URL("../../../../../.github/scripts/verify-trusted-tooling-identity.cjs", import.meta.url),
+  );
+  const result = spawnSync(process.execPath, [verifierPath], {
+    encoding: "utf8",
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status === 0) return;
+
+  const detail = (result.stderr || result.stdout || "verification process failed").trim();
+  fail(`Trusted tooling authorization changed before package mutation: ${detail}`);
 }
 
 function resolvePackagePublishWaitTimeout(options: PackagePublishOptions) {
@@ -2344,23 +2392,28 @@ async function uploadClawPackToStorage(
   publishToken: string,
   file: PackageFile,
   spinner: ReturnType<typeof createCrabLoader> | null,
+  revalidateTrustedTooling: () => Promise<void> | void,
+  trustedToolingBoundary: boolean,
 ) {
   if (spinner) spinner.text = `Uploading ${file.relPath}`;
+  await revalidateTrustedTooling();
   const { uploadUrl, uploadTicket } = await apiRequest(
     registry,
     {
       method: "POST",
       path: LegacyApiRoutes.cliUploadUrl,
       token: publishToken,
+      ...(trustedToolingBoundary ? { retryCount: 0 } : {}),
     },
     ApiCliUploadUrlResponseSchema,
   );
+  await revalidateTrustedTooling();
   const result = await uploadBinary(
     {
       url: uploadUrl,
       bytes: file.bytes,
       contentType: file.contentType ?? "application/octet-stream",
-      retryCount: PACKAGE_PUBLISH_RETRY_COUNT,
+      retryCount: trustedToolingBoundary ? 0 : PACKAGE_PUBLISH_RETRY_COUNT,
     },
     ApiUploadFileResponseSchema,
   );
@@ -2773,6 +2826,8 @@ async function mintPackagePublishToken(
   packageName: string,
   version: string,
   githubOidcToken: string,
+  scope: "upload" | "publish",
+  inventoryDigest: string,
 ) {
   const response = await apiRequest(
     registry,
@@ -2783,6 +2838,11 @@ async function mintPackagePublishToken(
         packageName,
         version,
         githubOidcToken,
+        scope,
+        inventoryDigest,
+        ...(process.env.TRUSTED_TOOLING_IDENTITY_JSON?.trim()
+          ? { trustedToolingIdentityJson: process.env.TRUSTED_TOOLING_IDENTITY_JSON.trim() }
+          : {}),
       },
     },
     ApiV1PublishTokenMintResponseSchema,
@@ -2794,15 +2854,17 @@ async function resolvePackagePublishToken(params: {
   registry: string;
   packageName: string;
   version: string;
+  scope: "upload" | "publish";
+  inventoryDigest: string;
   manualOverrideReason?: string;
   spinner: ReturnType<typeof createCrabLoader> | null;
 }) {
   if (params.manualOverrideReason?.trim()) {
-    return await requireAuthToken();
+    return { kind: "user" as const, token: await requireAuthToken() };
   }
 
   if (!hasGitHubActionsOidcEnv()) {
-    return await requireAuthToken();
+    return { kind: "user" as const, token: await requireAuthToken() };
   }
 
   if (params.spinner) {
@@ -2813,12 +2875,17 @@ async function resolvePackagePublishToken(params: {
     if (params.spinner) {
       params.spinner.text = "Minting short-lived ClawHub publish token";
     }
-    return await mintPackagePublishToken(
-      params.registry,
-      params.packageName,
-      params.version,
-      githubOidcToken,
-    );
+    return {
+      kind: "github-actions" as const,
+      token: await mintPackagePublishToken(
+        params.registry,
+        params.packageName,
+        params.version,
+        githubOidcToken,
+        params.scope,
+        params.inventoryDigest,
+      ),
+    };
   } catch (error) {
     const status =
       typeof error === "object" && error !== null && "status" in error
@@ -2830,7 +2897,7 @@ async function resolvePackagePublishToken(params: {
     if (params.spinner) {
       params.spinner.text = "Trusted publishing unavailable, falling back to ClawHub token";
     }
-    return await requireAuthToken();
+    return { kind: "user" as const, token: await requireAuthToken() };
   }
 }
 

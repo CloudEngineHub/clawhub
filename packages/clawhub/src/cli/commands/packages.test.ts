@@ -33,6 +33,7 @@ const inspectorMocks = {
 };
 const originalOidcRequestUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
 const originalOidcRequestToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+const originalTrustedToolingIdentity = process.env.TRUSTED_TOOLING_IDENTITY_JSON;
 
 vi.mock("../../http.js", () => httpMocks.moduleFactory());
 vi.mock("../registry.js", () => registryMocks.moduleFactory());
@@ -252,6 +253,11 @@ afterEach(() => {
     delete process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
   } else {
     process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = originalOidcRequestToken;
+  }
+  if (originalTrustedToolingIdentity === undefined) {
+    delete process.env.TRUSTED_TOOLING_IDENTITY_JSON;
+  } else {
+    process.env.TRUSTED_TOOLING_IDENTITY_JSON = originalTrustedToolingIdentity;
   }
 });
 
@@ -2007,8 +2013,8 @@ describe("package commands", () => {
         (call) => (call[1] as { method?: string }).method === "GET",
       );
       expect(statusCalls.map((call) => (call[1] as { token?: string }).token)).toEqual([
-        "short_token_1",
         "short_token_2",
+        "short_token_3",
       ]);
       expect(mockWrite).toHaveBeenCalledTimes(1);
       expect(JSON.parse(String(mockWrite.mock.calls[0]?.[0] ?? ""))).toMatchObject({
@@ -2317,6 +2323,54 @@ describe("package commands", () => {
     }
   });
 
+  it("revalidates authorization immediately before a single-attempt package POST", async () => {
+    const workdir = await makeTmpWorkdir();
+    try {
+      const packName = "authorized-plugin-1.0.0.tgz";
+      await writeFile(
+        join(workdir, packName),
+        npmPackFixture({
+          "package/package.json": makeCodePluginPackageJson({
+            name: "@scope/authorized-plugin",
+            displayName: "Authorized Plugin",
+            version: "1.0.0",
+          }),
+          "package/openclaw.plugin.json": JSON.stringify({ id: "authorized.plugin" }),
+          "package/dist/index.js": "export const demo = true;\n",
+        }),
+      );
+      httpMocks.apiRequestForm.mockResolvedValueOnce({
+        ok: true,
+        packageId: "pkg_1",
+        releaseId: "rel_1",
+        publicationStatus: "published",
+      });
+      const revalidateTrustedTooling = vi.fn<() => Promise<void>>().mockResolvedValue();
+
+      await cmdPublishPackage(
+        makeOpts(workdir),
+        packName,
+        {
+          sourceRepo: "openclaw/authorized-plugin",
+          sourceCommit: "abc123",
+        },
+        { revalidateTrustedTooling },
+      );
+
+      expect(revalidateTrustedTooling).toHaveBeenCalledTimes(1);
+      expect(httpMocks.apiRequestForm).toHaveBeenCalledWith(
+        "https://clawhub.ai",
+        expect.objectContaining({
+          path: "/api/v1/packages",
+          retryCount: 0,
+        }),
+        expect.anything(),
+      );
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
+    }
+  });
+
   it("stages ClawPack tarballs over the multipart publish budget", async () => {
     const workdir = await makeTmpWorkdir();
     try {
@@ -2371,6 +2425,61 @@ describe("package commands", () => {
       expect(getPublishForm().get("clawpackUploadTicket")).toBe("uploadTickets:clawpack");
       expect(getPublishPayload()).not.toHaveProperty("artifact");
       expect(getPublishPayload()).not.toHaveProperty("files");
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
+    }
+  });
+
+  it("stops after staged upload when parent authorization is cancelled before publish", async () => {
+    const workdir = await makeTmpWorkdir();
+    try {
+      const packName = "cancelled-parent-plugin-1.0.0.tgz";
+      const packBytes = npmPackFixture({
+        "package/package.json": makeCodePluginPackageJson({
+          name: "@scope/cancelled-parent-plugin",
+          displayName: "Cancelled Parent Plugin",
+          version: "1.0.0",
+        }),
+        "package/openclaw.plugin.json": JSON.stringify({ id: "cancelled.parent.plugin" }),
+        "package/dist/index.js": "export const demo = true;\n",
+        "package/dist/model.bin": randomBytes(24 * 1024 * 1024),
+      });
+      await writeFile(join(workdir, packName), packBytes);
+      httpMocks.apiRequest.mockResolvedValueOnce({
+        uploadUrl: "https://upload.local",
+        uploadTicket: "uploadTickets:clawpack",
+      });
+      httpMocks.uploadBinary.mockResolvedValueOnce({ storageId: "storage:clawpack" });
+      const revalidateTrustedTooling = vi
+        .fn<() => Promise<void>>()
+        .mockResolvedValueOnce()
+        .mockResolvedValueOnce()
+        .mockRejectedValueOnce(new Error("release parent was cancelled"));
+
+      await expect(
+        cmdPublishPackage(
+          makeOpts(workdir),
+          packName,
+          {
+            sourceRepo: "openclaw/cancelled-parent-plugin",
+            sourceCommit: "abc123",
+          },
+          { revalidateTrustedTooling },
+        ),
+      ).rejects.toThrow("release parent was cancelled");
+
+      expect(revalidateTrustedTooling).toHaveBeenCalledTimes(3);
+      expect(httpMocks.apiRequest).toHaveBeenCalledWith(
+        "https://clawhub.ai",
+        expect.objectContaining({ retryCount: 0 }),
+        expect.anything(),
+      );
+      expect(httpMocks.uploadBinary).toHaveBeenCalledWith(
+        expect.objectContaining({ retryCount: 0 }),
+        expect.anything(),
+      );
+      expect(httpMocks.uploadBinary).toHaveBeenCalledTimes(1);
+      expect(httpMocks.apiRequestForm).not.toHaveBeenCalled();
     } finally {
       await rm(workdir, { recursive: true, force: true });
     }
@@ -2804,16 +2913,18 @@ describe("package commands", () => {
     }
   });
 
-  it("mints a short-lived publish token from GitHub Actions OIDC in CI", async () => {
+  it("uses distinct scoped tokens for an oversized GitHub Actions publish", async () => {
     const workdir = await makeTmpWorkdir();
     try {
       process.env.ACTIONS_ID_TOKEN_REQUEST_URL = "https://token.actions.githubusercontent.com/oidc";
       process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = "gh-request-token";
-      const fetchMock = vi.fn().mockResolvedValue(
-        new Response(JSON.stringify({ value: "github-oidc-jwt" }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
+      process.env.TRUSTED_TOOLING_IDENTITY_JSON = '{"version":2,"test":"identity"}';
+      const fetchMock = vi.fn().mockImplementation(
+        async () =>
+          new Response(JSON.stringify({ value: "github-oidc-jwt" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
       );
       vi.stubGlobal("fetch", fetchMock);
 
@@ -2833,21 +2944,43 @@ describe("package commands", () => {
         JSON.stringify({ id: "demo.plugin" }),
         "utf8",
       );
+      await mkdir(join(folder, "dist"), { recursive: true });
+      await writeFile(join(folder, "dist", "index.js"), "export const demo = true;\n", "utf8");
+      await writeFile(join(folder, "dist", "model.bin"), randomBytes(24 * 1024 * 1024));
 
-      httpMocks.apiRequest.mockResolvedValueOnce({
-        token: "clh_short_publish",
-        expiresAt: 1_234_567_890,
-      });
+      httpMocks.apiRequest.mockImplementation(
+        async (_registry: string, request: { path?: string; body?: { scope?: string } }) => {
+          if (request.path === "/api/cli/upload-url") {
+            return {
+              uploadUrl: "https://upload.local",
+              uploadTicket: "packagePublishUploadTickets:1",
+            };
+          }
+          if (request.path === "/api/v1/publish/token/mint") {
+            return {
+              token: request.body?.scope === "publish" ? "clh_short_publish" : "clh_short_upload",
+              expiresAt: 1_234_567_890,
+            };
+          }
+          throw new Error(`Unexpected API request: ${request.path}`);
+        },
+      );
+      httpMocks.uploadBinary.mockResolvedValueOnce({ storageId: "storage:clawpack" });
       httpMocks.apiRequestForm.mockResolvedValueOnce({
         ok: true,
         packageId: "pkg_1",
         releaseId: "rel_1",
       });
 
-      await cmdPublishPackage(makeOpts(workdir), "demo-plugin", {
-        sourceRepo: "openclaw/demo-plugin",
-        sourceCommit: "abc123",
-      });
+      await cmdPublishPackage(
+        makeOpts(workdir),
+        "demo-plugin",
+        {
+          sourceRepo: "openclaw/demo-plugin",
+          sourceCommit: "abc123",
+        },
+        { revalidateTrustedTooling: vi.fn() },
+      );
 
       expect(authTokenMocks.requireAuthToken).not.toHaveBeenCalled();
       expect(fetchMock).toHaveBeenCalledWith(
@@ -2859,16 +2992,55 @@ describe("package commands", () => {
           }),
         }),
       );
-      expect(httpMocks.apiRequest).toHaveBeenCalledWith(
+      expect(httpMocks.apiRequest).toHaveBeenNthCalledWith(
+        1,
         "https://clawhub.ai",
         expect.objectContaining({
           method: "POST",
           path: "/api/v1/publish/token/mint",
-          body: {
+          body: expect.objectContaining({
             packageName: "@scope/demo-plugin",
             version: "1.0.0",
             githubOidcToken: "github-oidc-jwt",
-          },
+            scope: "upload",
+            inventoryDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+            trustedToolingIdentityJson: '{"version":2,"test":"identity"}',
+          }),
+        }),
+        expect.anything(),
+      );
+      expect(httpMocks.apiRequest).toHaveBeenNthCalledWith(
+        3,
+        "https://clawhub.ai",
+        expect.objectContaining({
+          method: "POST",
+          path: "/api/v1/publish/token/mint",
+          body: expect.objectContaining({
+            packageName: "@scope/demo-plugin",
+            version: "1.0.0",
+            githubOidcToken: "github-oidc-jwt",
+            scope: "publish",
+            inventoryDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+            trustedToolingIdentityJson: '{"version":2,"test":"identity"}',
+          }),
+        }),
+        expect.anything(),
+      );
+      expect(httpMocks.apiRequest).toHaveBeenNthCalledWith(
+        2,
+        "https://clawhub.ai",
+        expect.objectContaining({
+          method: "POST",
+          path: "/api/cli/upload-url",
+          token: "clh_short_upload",
+          retryCount: 0,
+        }),
+        expect.anything(),
+      );
+      expect(httpMocks.uploadBinary).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: "https://upload.local",
+          retryCount: 0,
         }),
         expect.anything(),
       );
@@ -2876,7 +3048,10 @@ describe("package commands", () => {
         | { token?: string }
         | undefined;
       expect(publishArgs?.token).toBe("clh_short_publish");
+      expect(getPublishForm().get("clawpack")).toBe("storage:clawpack");
+      expect(getPublishForm().get("clawpackUploadTicket")).toBe("packagePublishUploadTickets:1");
     } finally {
+      delete process.env.TRUSTED_TOOLING_IDENTITY_JSON;
       await rm(workdir, { recursive: true, force: true });
     }
   });

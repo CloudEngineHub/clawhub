@@ -202,10 +202,13 @@ describe("package publish workflow", () => {
       jobs?: {
         publish?: {
           steps?: Array<{
+            "continue-on-error"?: boolean;
             env?: Record<string, string>;
             if?: string;
             name?: string;
             run?: string;
+            uses?: string;
+            with?: Record<string, string>;
           }>;
         };
       };
@@ -214,22 +217,66 @@ describe("package publish workflow", () => {
     const verifyIndex = steps.findIndex(
       (step) => step.name === "Revalidate trusted tooling identity",
     );
+    const parentReceiptIndex = steps.findIndex(
+      (step) => step.name === "Download release parent authorization receipt",
+    );
+    const recoveryReceiptIndex = steps.findIndex(
+      (step) => step.name === "Download recovery environment approval receipt",
+    );
     const publishIndex = steps.findIndex((step) => step.name === "Run package publish");
     const verifyStep = steps[verifyIndex];
+    const publishStep = steps[publishIndex];
+    const parentReceiptStep = steps[parentReceiptIndex];
+    const recoveryReceiptStep = steps[recoveryReceiptIndex];
 
     expect(workflow.on?.workflow_call?.inputs?.trusted_tooling_identity_json).toEqual({
       description:
-        "Optional versioned trusted tooling workflow identity JSON to revalidate immediately before publication.",
+        "Optional versioned trusted tooling and release-parent run identity; immutable authorization receipts are then required.",
       required: false,
       type: "string",
       default: "",
     });
+    expect(parentReceiptIndex).toBeGreaterThan(-1);
+    expect(recoveryReceiptIndex).toBe(parentReceiptIndex + 1);
+    expect(verifyIndex).toBe(recoveryReceiptIndex + 1);
     expect(verifyIndex).toBeGreaterThan(-1);
     expect(verifyIndex + 1).toBe(publishIndex);
+    expect(parentReceiptStep).toMatchObject({
+      if: "inputs.trusted_tooling_identity_json != ''",
+      uses: "actions/download-artifact@v8",
+      with: {
+        "github-token": "${{ github.token }}",
+        repository: "${{ fromJson(inputs.trusted_tooling_identity_json).parentRepository }}",
+        "run-id": "${{ fromJson(inputs.trusted_tooling_identity_json).parentRunId }}",
+      },
+    });
+    expect(parentReceiptStep?.with?.name).toContain("openclaw-clawhub-parent-authorization-v2-");
+    expect(parentReceiptStep?.with?.name).toContain(
+      "${{ fromJson(inputs.trusted_tooling_identity_json).runId }}",
+    );
+    expect(parentReceiptStep?.with?.name).toContain(
+      "${{ fromJson(inputs.trusted_tooling_identity_json).runAttempt }}",
+    );
+    expect(recoveryReceiptStep).toMatchObject({
+      id: "recovery_approval",
+      if: "inputs.trusted_tooling_identity_json != ''",
+      "continue-on-error": true,
+      uses: "actions/download-artifact@v8",
+      with: {
+        name: "openclaw-clawhub-recovery-approval-${{ github.run_id }}-${{ github.run_attempt }}",
+        "github-token": "${{ github.token }}",
+        repository: "${{ github.repository }}",
+        "run-id": "${{ github.run_id }}",
+      },
+    });
     expect(verifyStep?.if).toBe("inputs.trusted_tooling_identity_json != ''");
     expect(verifyStep?.env).toMatchObject({
       GH_TOKEN: "${{ github.token }}",
       TRUSTED_TOOLING_IDENTITY_JSON: "${{ inputs.trusted_tooling_identity_json }}",
+      PARENT_AUTHORIZATION_RECEIPT_PATH:
+        "${{ runner.temp }}/openclaw-clawhub-parent-authorization/authorization.json",
+      RECOVERY_APPROVAL_RECEIPT_PATH:
+        "${{ steps.recovery_approval.outcome == 'success' && format('{0}/openclaw-clawhub-recovery-approval/approval.json', runner.temp) || '' }}",
       GITHUB_REPOSITORY: "${{ github.repository }}",
       GITHUB_RUN_ID: "${{ github.run_id }}",
       GITHUB_RUN_ATTEMPT: "${{ github.run_attempt }}",
@@ -239,14 +286,28 @@ describe("package publish workflow", () => {
       GITHUB_REF_NAME: "${{ github.ref_name }}",
       GITHUB_SHA: "${{ github.sha }}",
       GITHUB_EVENT_NAME: "${{ github.event_name }}",
+      GITHUB_ACTOR: "${{ github.actor }}",
     });
     expect(verifyStep?.run).toContain("verify-trusted-tooling-identity.cjs");
+    expect(publishStep?.env).toMatchObject({
+      GH_TOKEN: "${{ github.token }}",
+      TRUSTED_TOOLING_IDENTITY_JSON: "${{ inputs.trusted_tooling_identity_json }}",
+      PARENT_AUTHORIZATION_RECEIPT_PATH:
+        "${{ runner.temp }}/openclaw-clawhub-parent-authorization/authorization.json",
+      RECOVERY_APPROVAL_RECEIPT_PATH:
+        "${{ steps.recovery_approval.outcome == 'success' && format('{0}/openclaw-clawhub-recovery-approval/approval.json', runner.temp) || '' }}",
+      GITHUB_ACTOR: "${{ github.actor }}",
+    });
   });
 
   it("passes the trusted tooling identity behavior contract", () => {
     const result = spawnSync(
       process.execPath,
-      ["--test", ".github/scripts/verify-trusted-tooling-identity.node-test.cjs"],
+      [
+        "--test",
+        "--test-reporter=tap",
+        ".github/scripts/verify-trusted-tooling-identity.node-test.cjs",
+      ],
       { encoding: "utf8" },
     );
 

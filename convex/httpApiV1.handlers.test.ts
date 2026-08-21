@@ -23,6 +23,10 @@ vi.mock("./lib/githubActionsOidc", () => ({
   verifyGitHubActionsTrustedPublishJwt: vi.fn(),
 }));
 
+vi.mock("./lib/openClawPublishAuthorization", () => ({
+  verifyOpenClawPublishAuthorization: vi.fn(),
+}));
+
 vi.mock("./skills", () => ({
   publishVersionForUser: vi.fn(),
 }));
@@ -36,6 +40,7 @@ const {
 } = await import("./lib/apiTokenAuth");
 const { fetchGitHubRepositoryIdentity, verifyGitHubActionsTrustedPublishJwt } =
   await import("./lib/githubActionsOidc");
+const { verifyOpenClawPublishAuthorization } = await import("./lib/openClawPublishAuthorization");
 const { buildBundleFingerprint } = await import("./lib/skillCards");
 const { sha256Hex } = await import("./lib/clawpack");
 const { publishVersionForUser } = await import("./skills");
@@ -329,6 +334,7 @@ beforeEach(() => {
   vi.mocked(requirePackagePublishAuth).mockReset();
   vi.mocked(fetchGitHubRepositoryIdentity).mockReset();
   vi.mocked(verifyGitHubActionsTrustedPublishJwt).mockReset();
+  vi.mocked(verifyOpenClawPublishAuthorization).mockReset();
   vi.mocked(publishVersionForUser).mockReset();
 });
 
@@ -16939,11 +16945,11 @@ describe("httpApiV1 handlers", () => {
     });
   });
 
-  it("mints a short-lived publish token after verifying GitHub OIDC", async () => {
+  it("derives one transaction key for scoped GitHub upload and publish tokens", async () => {
     vi.mocked(verifyGitHubActionsTrustedPublishJwt).mockResolvedValue({
-      repository: "openclaw/openclaw",
+      repository: "example/example",
       repositoryId: "1",
-      repositoryOwner: "openclaw",
+      repositoryOwner: "example",
       repositoryOwnerId: "2",
       workflowFilename: "plugin-clawhub-release.yml",
       environment: "clawhub-release",
@@ -16955,6 +16961,139 @@ describe("httpApiV1 handlers", () => {
       actor: "onur",
       actorId: "42",
     } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return "mutation:ok";
+    });
+    const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
+      if ("name" in args) {
+        return {
+          _id: "packages:1",
+          name: "@openclaw/demo-plugin",
+          ownerUserId: "users:owner",
+        };
+      }
+      if ("packageId" in args) {
+        return {
+          _id: "packageTrustedPublishers:1",
+          packageId: "packages:1",
+          provider: "github-actions",
+          repository: "example/example",
+          repositoryId: "1",
+          repositoryOwner: "example",
+          repositoryOwnerId: "2",
+          workflowFilename: "plugin-clawhub-release.yml",
+          environment: "clawhub-release",
+        };
+      }
+      return null;
+    });
+
+    const mint = async (scope: "upload" | "publish") =>
+      await __handlers.mintPublishTokenV1Handler(
+        makeCtx({ runQuery, runMutation }),
+        new Request("https://example.com/api/v1/publish/token/mint", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            packageName: "@openclaw/demo-plugin",
+            version: "1.0.0",
+            githubOidcToken: "gh.jwt",
+            scope,
+            inventoryDigest: "e".repeat(64),
+          }),
+        }),
+      );
+
+    const uploadResponse = await mint("upload");
+    const publishResponse = await mint("publish");
+    if (uploadResponse.status !== 200) throw new Error(await uploadResponse.text());
+    if (publishResponse.status !== 200) throw new Error(await publishResponse.text());
+    await expect(uploadResponse.json()).resolves.toMatchObject({
+      token: expect.any(String),
+      expiresAt: expect.any(Number),
+    });
+    await expect(publishResponse.json()).resolves.toMatchObject({
+      token: expect.any(String),
+      expiresAt: expect.any(Number),
+    });
+    expect(runMutation).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        key: "ip:unknown:trustedPublish",
+        name: "trustedPublishIp",
+        config: expect.objectContaining({ rate: RATE_LIMITS.trustedPublish.ip }),
+      }),
+    );
+    const tokenMints = runMutation.mock.calls
+      .map(([, args]) => args)
+      .filter((args) => args.packageId === "packages:1");
+    expect(tokenMints).toHaveLength(2);
+    const authorizationTransactionKey = tokenMints[0]?.authorizationTransactionKey;
+    expect(authorizationTransactionKey).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/));
+    if (typeof authorizationTransactionKey !== "string") {
+      throw new Error("Missing derived authorization transaction key");
+    }
+    expect(tokenMints[0]).toMatchObject({
+      version: "1.0.0",
+      repository: "example/example",
+      workflowFilename: "plugin-clawhub-release.yml",
+      environment: "clawhub-release",
+      runId: "101",
+      sha: "abc123",
+      scope: "upload",
+      inventoryDigest: "e".repeat(64),
+      authorizationTransactionKey,
+    });
+    expect(tokenMints[1]).toMatchObject({
+      scope: "publish",
+      authorizationTransactionKey,
+    });
+    expect(tokenMints[0]?.authorizationKey).toBe(`${authorizationTransactionKey}:upload`);
+    expect(tokenMints[1]?.authorizationKey).toBe(`${authorizationTransactionKey}:publish`);
+  });
+
+  it("requires and stores v2 authorization for newer OpenClaw workflow revisions", async () => {
+    vi.mocked(verifyGitHubActionsTrustedPublishJwt).mockResolvedValue({
+      repository: "openclaw/openclaw",
+      repositoryId: "1",
+      repositoryOwner: "openclaw",
+      repositoryOwnerId: "2",
+      workflowFilename: "plugin-clawhub-release.yml",
+      environment: "clawhub-release",
+      runId: "101",
+      runAttempt: "2",
+      sha: "c".repeat(40),
+      ref: "refs/heads/release/2026.8.3",
+      actor: "release-app[bot]",
+      actorId: "42",
+      jobWorkflowSha: "f".repeat(40),
+    } as never);
+    vi.mocked(verifyOpenClawPublishAuthorization).mockResolvedValue({
+      identity: {
+        version: 2,
+        repository: "openclaw/openclaw",
+        workflow: ".github/workflows/plugin-clawhub-release.yml",
+        runId: "101",
+        runAttempt: "2",
+        ref: "release/2026.8.3",
+        fullRef: "refs/heads/release/2026.8.3",
+        sha: "c".repeat(40),
+        candidateRepository: "openclaw/openclaw",
+        candidateSha: "b".repeat(40),
+        toolingRef: "main",
+        toolingFullRef: "refs/heads/main",
+        toolingSha: "a".repeat(40),
+        parentRepository: "openclaw/openclaw",
+        parentWorkflow: ".github/workflows/openclaw-release-publish.yml",
+        parentRunId: "99",
+        parentRunAttempt: "3",
+      },
+      authorizationRoute: "automated-awaited",
+      artifactId: "artifact-101",
+      artifactDigest: `sha256:${"d".repeat(64)}`,
+      transactionKey: "exact-transaction",
+    });
     const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
       if ("key" in args) return okRate();
       return "mutation:ok";
@@ -16992,41 +17131,103 @@ describe("httpApiV1 handlers", () => {
           packageName: "@openclaw/demo-plugin",
           version: "1.0.0",
           githubOidcToken: "gh.jwt",
+          scope: "publish",
+          inventoryDigest: "e".repeat(64),
+          trustedToolingIdentityJson: '{"version":2}',
         }),
       }),
     );
 
     if (response.status !== 200) throw new Error(await response.text());
-    const body = await response.json();
-    expect(body.token).toEqual(expect.any(String));
-    expect(body.expiresAt).toEqual(expect.any(Number));
-    expect(runMutation).toHaveBeenCalledWith(
-      expect.anything(),
+    expect(verifyOpenClawPublishAuthorization).toHaveBeenCalledWith(
       expect.objectContaining({
-        key: "ip:unknown:trustedPublish",
-        name: "trustedPublishIp",
-        config: expect.objectContaining({ rate: RATE_LIMITS.trustedPublish.ip }),
+        rawIdentity: '{"version":2}',
+        packageName: "@openclaw/demo-plugin",
+        version: "1.0.0",
+        inventoryDigest: "e".repeat(64),
       }),
     );
     expect(runMutation).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
-        packageId: "packages:1",
-        version: "1.0.0",
-        repository: "openclaw/openclaw",
-        workflowFilename: "plugin-clawhub-release.yml",
-        environment: "clawhub-release",
-        runId: "101",
-        sha: "abc123",
+        authorizationVersion: 2,
+        authorizationTransactionKey: "exact-transaction",
+        authorizationKey: "exact-transaction:publish",
+        inventoryDigest: "e".repeat(64),
+        trustedToolingIdentityJson: '{"version":2}',
+        candidateSha: "b".repeat(40),
+        parentRunId: "99",
       }),
     );
   });
 
-  it("mints a short-lived publish token without environment when none is pinned", async () => {
+  it.each([
+    ["GitHub Actions bot", "github-actions[bot]", "a42cd2f73d6afb769b271d463fc111669cb7a499"],
+    ["GitHub App bot", "release-app[bot]", "a42cd2f73d6afb769b271d463fc111669cb7a499"],
+    ["newer workflow", "onur", "f".repeat(40)],
+  ])("rejects %s OpenClaw OIDC without v2 authorization", async (_label, actor, jobWorkflowSha) => {
     vi.mocked(verifyGitHubActionsTrustedPublishJwt).mockResolvedValue({
       repository: "openclaw/openclaw",
       repositoryId: "1",
       repositoryOwner: "openclaw",
+      repositoryOwnerId: "2",
+      workflowFilename: "plugin-clawhub-release.yml",
+      runId: "101",
+      runAttempt: "1",
+      sha: "c".repeat(40),
+      ref: "refs/heads/main",
+      actor,
+      jobWorkflowSha,
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return "mutation:ok";
+    });
+    const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
+      if ("name" in args) {
+        return {
+          _id: "packages:1",
+          name: "@openclaw/demo-plugin",
+          ownerUserId: "users:owner",
+        };
+      }
+      if ("packageId" in args) {
+        return {
+          packageId: "packages:1",
+          provider: "github-actions",
+          repository: "openclaw/openclaw",
+          repositoryId: "1",
+          repositoryOwner: "openclaw",
+          repositoryOwnerId: "2",
+          workflowFilename: "plugin-clawhub-release.yml",
+        };
+      }
+      return null;
+    });
+
+    const response = await __handlers.mintPublishTokenV1Handler(
+      makeCtx({ runQuery, runMutation }),
+      new Request("https://example.com/api/v1/publish/token/mint", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          packageName: "@openclaw/demo-plugin",
+          version: "1.0.0",
+          githubOidcToken: "gh.jwt",
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toContain("authorization version 2");
+    expect(verifyOpenClawPublishAuthorization).not.toHaveBeenCalled();
+  });
+
+  it("mints a short-lived publish token without environment when none is pinned", async () => {
+    vi.mocked(verifyGitHubActionsTrustedPublishJwt).mockResolvedValue({
+      repository: "example/example",
+      repositoryId: "1",
+      repositoryOwner: "example",
       repositoryOwnerId: "2",
       workflowFilename: "plugin-clawhub-release.yml",
       environment: "clawhub-release",
@@ -17055,9 +17256,9 @@ describe("httpApiV1 handlers", () => {
           _id: "packageTrustedPublishers:1",
           packageId: "packages:1",
           provider: "github-actions",
-          repository: "openclaw/openclaw",
+          repository: "example/example",
           repositoryId: "1",
-          repositoryOwner: "openclaw",
+          repositoryOwner: "example",
           repositoryOwnerId: "2",
           workflowFilename: "plugin-clawhub-release.yml",
         };
@@ -17090,7 +17291,7 @@ describe("httpApiV1 handlers", () => {
       expect.objectContaining({
         packageId: "packages:1",
         version: "1.0.0",
-        repository: "openclaw/openclaw",
+        repository: "example/example",
         workflowFilename: "plugin-clawhub-release.yml",
         runId: "101",
         sha: "abc123",
