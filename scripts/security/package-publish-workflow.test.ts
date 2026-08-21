@@ -40,6 +40,10 @@ describe("package publish reusable workflow", () => {
       type: "number",
       default: 30,
     });
+    expect(workflow.on?.workflow_call?.inputs?.trusted_tooling_identity_json).toMatchObject({
+      type: "string",
+      default: "",
+    });
 
     const job = workflow.jobs.publish;
     expect(job["timeout-minutes"]).toBe(75);
@@ -68,5 +72,23 @@ describe("package publish reusable workflow", () => {
       WAIT_FOR_PUBLICATION: "${{ inputs.wait_for_publication }}",
     });
     expect(captureStep?.run).toContain('parsed.get("publicationStatus") != "published"');
+
+    const verifyIndex = job.steps.findIndex(
+      (step) => step.name === "Revalidate trusted tooling identity",
+    );
+    const publishIndex = job.steps.findIndex((step) => step.name === "Run package publish");
+    const verifyStep = job.steps[verifyIndex];
+    expect(verifyIndex + 1).toBe(publishIndex);
+    expect(verifyStep?.env).toMatchObject({
+      GH_TOKEN: "${{ github.token }}",
+      TRUSTED_TOOLING_IDENTITY_JSON: "${{ inputs.trusted_tooling_identity_json }}",
+      GITHUB_REPOSITORY: "${{ github.repository }}",
+      GITHUB_RUN_ID: "${{ github.run_id }}",
+      GITHUB_RUN_ATTEMPT: "${{ github.run_attempt }}",
+      GITHUB_WORKFLOW_REF: "${{ github.workflow_ref }}",
+      GITHUB_WORKFLOW_SHA: "${{ github.workflow_sha }}",
+      GITHUB_EVENT_NAME: "${{ github.event_name }}",
+    });
+    expect(verifyStep?.run).toContain("verify-trusted-tooling-identity.cjs");
   });
 });
