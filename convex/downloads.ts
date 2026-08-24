@@ -2,7 +2,7 @@ import { api, internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 import { buildDownloadMetricArgs, getDownloadIdentity } from "./downloadMetrics";
 import { httpAction } from "./functions";
-import { ambiguousSkillSlugResponse } from "./httpApiV1/shared";
+import { ambiguousSkillSlugResponse, publicApiOrigin } from "./httpApiV1/shared";
 import { getOptionalActiveAuthUserIdFromAction } from "./lib/access";
 import { getOptionalApiTokenUserId } from "./lib/apiTokenAuth";
 import {
@@ -46,6 +46,7 @@ const ARCHIVE_MANIFEST_CLOCK_SKEW_MS = 5_000;
 const MAX_ARCHIVE_MANIFEST_FILES = 8_192;
 const MAX_ARCHIVE_MANIFEST_BYTES = 4 * 1024 * 1024;
 const MAX_ARCHIVE_METRIC_TOKEN_BYTES = 16 * 1024;
+const LOCAL_DOWNLOAD_HOSTS = new Set(["localhost", "127.0.0.1", "0.0.0.0", "[::1]"]);
 
 type DownloadCtx = Parameters<Parameters<typeof httpAction>[0]>[0];
 
@@ -82,6 +83,20 @@ export async function downloadZipHandler(
   }
 
   const manifestRequested = request.headers.get(ARCHIVE_MANIFEST_REQUEST_HEADER) === "v1";
+  const publicOrigin = publicApiOrigin(request);
+  const isLocalDownload = LOCAL_DOWNLOAD_HOSTS.has(url.hostname);
+  if (!manifestRequested && !isLocalDownload && publicOrigin !== url.origin) {
+    return new Response(null, {
+      status: 307,
+      headers: mergeHeaders(
+        {
+          Location: new URL(`${url.pathname}${url.search}`, publicOrigin).href,
+          "Cache-Control": "no-store",
+        },
+        corsHeaders(),
+      ),
+    });
+  }
   if (manifestRequested) {
     const token = request.headers.get(ARCHIVE_REQUEST_IDENTITY_HEADER)?.trim();
     const expectedEnvironment = expectedVercelEnvironmentForConvexSite(request.url);
