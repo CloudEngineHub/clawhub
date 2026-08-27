@@ -67,11 +67,6 @@ import {
   TRENDING_LEADERBOARD_KIND,
   TRENDING_NON_SUSPICIOUS_LEADERBOARD_KIND,
 } from "./lib/leaderboards";
-import {
-  applyManualOverrideToSkillPatch,
-  isManualOverrideReason,
-  type ManualModerationOverride,
-} from "./lib/manualOverrides";
 import { deriveModerationFlags } from "./lib/moderation";
 import { buildModerationSnapshot } from "./lib/moderationEngine";
 import {
@@ -220,7 +215,7 @@ const SLUG_RESERVATION_MS = SLUG_RESERVATION_DAYS * RATE_LIMIT_DAY_MS;
 const UNPUBLISHED_SLUG_RESERVATION_DAYS = 30;
 const UNPUBLISHED_SLUG_RESERVATION_MS = UNPUBLISHED_SLUG_RESERVATION_DAYS * RATE_LIMIT_DAY_MS;
 const MAX_SKILL_SLUG_ALIASES_PER_MERGE = 200;
-const MAX_MANUAL_OVERRIDE_NOTE_LENGTH = 1200;
+const MAX_MODERATION_NOTE_LENGTH = 1200;
 const DEFAULT_STAFF_AUDIT_LOG_LIMIT = 10;
 const MAX_STAFF_AUDIT_LOG_LIMIT = 50;
 const USER_MODERATION_REASON = "user.moderation";
@@ -310,15 +305,13 @@ function buildStructuredModerationPatch(params: {
 
 type SkillModerationPatch = Partial<Doc<"skills">>;
 
-function trimManualOverrideNote(note: string) {
+function trimModerationNote(note: string) {
   const trimmed = note.trim();
   if (!trimmed) {
     throw new ConvexError("Audit note is required.");
   }
-  if (trimmed.length > MAX_MANUAL_OVERRIDE_NOTE_LENGTH) {
-    throw new ConvexError(
-      `Audit note must be at most ${MAX_MANUAL_OVERRIDE_NOTE_LENGTH} characters.`,
-    );
+  if (trimmed.length > MAX_MODERATION_NOTE_LENGTH) {
+    throw new ConvexError(`Audit note must be at most ${MAX_MODERATION_NOTE_LENGTH} characters.`);
   }
   return trimmed;
 }
@@ -413,7 +406,7 @@ function isClawScanMaliciousAnalysis(analysis: Doc<"skillVersions">["llmAnalysis
   return normalizeAnalysisStatus(analysis?.verdict ?? analysis?.status) === "malicious";
 }
 
-function buildScannerModerationPatchFromVersion(params: {
+export function buildScannerModerationPatchFromVersion(params: {
   owner: Doc<"users"> | null | undefined;
   version: Pick<Doc<"skillVersions">, "_id" | "staticScan" | "vtAnalysis" | "llmAnalysis">;
   now: number;
@@ -486,32 +479,6 @@ function buildScannerModerationPatchFromVersion(params: {
   };
 }
 
-function buildPreservedSkillModerationPatch(skill: Doc<"skills">): SkillModerationPatch {
-  return {
-    moderationReasonCodes: skill.moderationReasonCodes,
-    moderationEvidence: skill.moderationEvidence,
-    moderationEngineVersion: skill.moderationEngineVersion,
-    moderationSourceVersionId: skill.moderationSourceVersionId,
-  };
-}
-
-function applySkillManualOverrideToSkillPatch(params: {
-  skill: Pick<Doc<"skills">, "manualOverride">;
-  basePatch: SkillModerationPatch;
-  now: number;
-  stripUpdatedAt?: boolean;
-}) {
-  if (!params.skill.manualOverride) return params.basePatch;
-  const patch = applyManualOverrideToSkillPatch({
-    basePatch: params.basePatch,
-    override: params.skill.manualOverride,
-    now: params.now,
-  });
-  if (!params.stripUpdatedAt) return patch;
-  const { updatedAt: _updatedAt, ...timestampFreePatch } = patch;
-  return timestampFreePatch;
-}
-
 async function patchStructuredModerationFromVersion(
   ctx: MutationCtx,
   skill: Doc<"skills">,
@@ -522,16 +489,10 @@ async function patchStructuredModerationFromVersion(
 ) {
   const now = Date.now();
   const owner = skill.ownerUserId ? await ctx.db.get(skill.ownerUserId) : null;
-  const basePatch = buildScannerModerationPatchFromVersion({
+  const patch = buildScannerModerationPatchFromVersion({
     owner,
     version,
     now,
-  });
-  const patch = applySkillManualOverrideToSkillPatch({
-    skill,
-    basePatch,
-    now,
-    stripUpdatedAt: true,
   });
 
   const shouldPersistClawScanMalwareBlock =
@@ -752,7 +713,6 @@ export function buildSkillVersionRevocationPlan(params: {
       moderationNotes: params.reason,
       hiddenAt: params.now,
       hiddenBy: params.actorUserId,
-      manualOverride: undefined,
       lastReviewedAt: params.now,
       updatedAt: params.now,
     } satisfies Partial<Doc<"skills">>,
@@ -823,15 +783,7 @@ async function quarantineMaliciousLatestSkillVersion(
           now,
         })
       : maliciousPatch;
-    Object.assign(
-      patch,
-      applySkillManualOverrideToSkillPatch({
-        skill,
-        basePatch,
-        now,
-        stripUpdatedAt: true,
-      }),
-    );
+    Object.assign(patch, basePatch);
   }
 
   const nextSkill = { ...skill, ...patch } as Doc<"skills">;
@@ -914,12 +866,7 @@ export const recomputeLatestSkillModerationInternal = internalMutation({
       version,
       now,
     });
-    const patch = applySkillManualOverrideToSkillPatch({
-      skill,
-      basePatch,
-      now,
-      stripUpdatedAt: true,
-    });
+    const patch = basePatch;
     const nextSkill = { ...skill, ...patch };
     await ctx.db.patch(skill._id, patch);
     await adjustGlobalPublicCountForSkillChange(ctx, skill, nextSkill);
@@ -946,15 +893,10 @@ export const previewLatestSkillModerationInternal = internalQuery({
     if (!version) return { ok: true as const, skipped: "missing_latest" as const };
 
     const owner = skill.ownerUserId ? await ctx.db.get(skill.ownerUserId) : null;
-    const patch = applySkillManualOverrideToSkillPatch({
-      skill,
-      basePatch: buildScannerModerationPatchFromVersion({
-        owner,
-        version,
-        now: Date.now(),
-      }),
+    const patch = buildScannerModerationPatchFromVersion({
+      owner,
+      version,
       now: Date.now(),
-      stripUpdatedAt: true,
     });
 
     return {
@@ -1030,10 +972,6 @@ function stripSuspiciousFlag(flags: string[] | undefined) {
   return next.length ? next : undefined;
 }
 
-function hasMalwareBlock(flags: string[] | undefined) {
-  return flags?.includes("blocked.malware") ?? false;
-}
-
 function isScannerManagedReason(reason: string | undefined) {
   if (!reason) return false;
   return (
@@ -1049,39 +987,13 @@ function shouldPreserveExistingModerationLock(
   skill: Pick<Doc<"skills">, "moderationStatus" | "moderationReason">,
 ) {
   if (skill.moderationStatus !== "hidden") return false;
-  if (isManualOverrideReason(skill.moderationReason)) return false;
   return !isScannerManagedReason(skill.moderationReason);
 }
 
-function buildManualOverrideRecord(params: {
-  note: string;
-  reviewerUserId: Id<"users">;
-  updatedAt: number;
-}): ManualModerationOverride {
-  return {
-    verdict: "clean",
-    note: trimManualOverrideNote(params.note),
-    reviewerUserId: params.reviewerUserId,
-    updatedAt: params.updatedAt,
-  };
-}
-
-function canApplySkillManualOverride(
-  skill: Pick<Doc<"skills">, "moderationStatus" | "moderationReason" | "moderationFlags">,
-) {
-  if (hasMalwareBlock(skill.moderationFlags)) return false;
-  if (shouldPreserveExistingModerationLock(skill)) return false;
-  return isSkillSuspicious(skill) || isManualOverrideReason(skill.moderationReason);
-}
-
 function shouldSyncModerationFromLatestVersion(
-  skill: Pick<
-    Doc<"skills">,
-    "manualOverride" | "moderationStatus" | "moderationReason" | "softDeletedAt"
-  >,
+  skill: Pick<Doc<"skills">, "moderationStatus" | "moderationReason" | "softDeletedAt">,
 ) {
   if (skill.softDeletedAt) return false;
-  if (skill.manualOverride) return true;
   if (skill.moderationStatus === "active") return true;
   if (skill.moderationStatus === "removed") return false;
   if (
@@ -1099,14 +1011,12 @@ function shouldBackfillLatestSkillModeration(
   skill: Pick<
     Doc<"skills">,
     | "latestVersionId"
-    | "manualOverride"
     | "moderationStatus"
     | "moderationReason"
     | "moderationSourceVersionId"
     | "softDeletedAt"
   >,
 ) {
-  if (skill.manualOverride) return false;
   if (!shouldSyncModerationFromLatestVersion(skill)) return false;
   if (!skill.latestVersionId) return false;
   if (isLegacyStaticScannerReason(skill.moderationReason as string | undefined)) return true;
@@ -1117,10 +1027,9 @@ function shouldBackfillLatestSkillModeration(
 function shouldForceBackfillLatestSkillModeration(
   skill: Pick<
     Doc<"skills">,
-    "latestVersionId" | "manualOverride" | "moderationStatus" | "moderationReason" | "softDeletedAt"
+    "latestVersionId" | "moderationStatus" | "moderationReason" | "softDeletedAt"
   >,
 ) {
-  if (skill.manualOverride) return false;
   if (!shouldSyncModerationFromLatestVersion(skill)) return false;
   if (!skill.latestVersionId) return false;
   return isScannerManagedReason(skill.moderationReason as string | undefined);
@@ -1158,12 +1067,7 @@ async function syncSkillModerationFromLatestVersion(
         updatedAt: now,
       };
 
-  const patch = applySkillManualOverrideToSkillPatch({
-    skill,
-    basePatch,
-    now,
-    stripUpdatedAt: true,
-  });
+  const patch = basePatch;
 
   const nextSkill = { ...skill, ...patch };
   await ctx.db.patch(skill._id, patch);
@@ -2699,7 +2603,6 @@ export const getBySlug = query({
     const publicSkill = toPublicSkill({ ...skill, badges });
 
     // Determine moderation state
-    const overrideActive = Boolean(skill.manualOverride);
     const isPendingScan =
       skill.moderationStatus === "hidden" && skill.moderationReason === "pending.scan";
     const isMalwareBlocked =
@@ -2748,12 +2651,7 @@ export const getBySlug = query({
     };
 
     // Moderation info - visible to owners for all states, or anyone for flagged skills (transparency)
-    const showModerationInfo =
-      isOwner || isMalwareBlocked || isSuspicious || isReviewFlagged || overrideActive;
-    const publicModerationSummary =
-      !isOwner && overrideActive && !isMalwareBlocked && !isSuspicious
-        ? "Security findings were reviewed by moderators and cleared for public use."
-        : skill.moderationSummary;
+    const showModerationInfo = isOwner || isMalwareBlocked || isSuspicious || isReviewFlagged;
     const moderationInfo = showModerationInfo
       ? {
           isPendingScan,
@@ -2762,10 +2660,9 @@ export const getBySlug = query({
           isReviewFlagged,
           isHiddenByMod,
           isRemoved,
-          overrideActive,
           verdict: skill.moderationVerdict,
           reasonCodes: skill.moderationReasonCodes,
-          summary: publicModerationSummary,
+          summary: skill.moderationSummary,
           engineVersion: skill.moderationEngineVersion,
           updatedAt: skill.moderationEvaluatedAt,
           sourceVersionId: skill.moderationSourceVersionId ?? null,
@@ -2898,7 +2795,6 @@ export const getVerifyTargetBySlugInternal = internalQuery({
       skill.moderationStatus === "hidden" && skill.moderationReason === "pending.scan";
     const isSuspicious = skill.moderationFlags?.includes("flagged.suspicious") ?? false;
     const isReviewFlagged = isSkillReviewFlagged(skill);
-    const overrideActive = Boolean(skill.manualOverride);
     const isHiddenByMod =
       skill.moderationStatus === "hidden" && !isPendingScan && !isMalwareBlocked;
     const isRemoved = skill.moderationStatus === "removed";
@@ -2926,7 +2822,6 @@ export const getVerifyTargetBySlugInternal = internalQuery({
         isReviewFlagged,
         isHiddenByMod,
         isRemoved,
-        overrideActive,
         verdict: skill.moderationVerdict,
         reasonCodes: skill.moderationReasonCodes,
         summary: skill.moderationSummary,
@@ -3442,7 +3337,6 @@ export const getSecurityVerdictTargetInternal = internalQuery({
       (skill.moderationFlags?.includes("blocked.malware") ?? false);
     const isSuspicious = skill.moderationFlags?.includes("flagged.suspicious") ?? false;
     const isReviewFlagged = isSkillReviewFlagged(skill);
-    const overrideActive = Boolean(skill.manualOverride);
     if (!isMalwareBlocked && !isPublicSkillDoc(skill)) return null;
 
     const owner = toPublicPublisher(
@@ -3462,12 +3356,7 @@ export const getSecurityVerdictTargetInternal = internalQuery({
     const isHiddenByMod =
       skill.moderationStatus === "hidden" && !isPendingScan && !isMalwareBlocked;
     const isRemoved = skill.moderationStatus === "removed";
-    const showModerationInfo =
-      isMalwareBlocked || isSuspicious || isReviewFlagged || overrideActive;
-    const publicModerationSummary =
-      overrideActive && !isMalwareBlocked && !isSuspicious
-        ? "Security findings were reviewed by moderators and cleared for public use."
-        : skill.moderationSummary;
+    const showModerationInfo = isMalwareBlocked || isSuspicious || isReviewFlagged;
 
     return {
       skill: {
@@ -3488,10 +3377,9 @@ export const getSecurityVerdictTargetInternal = internalQuery({
             isReviewFlagged,
             isHiddenByMod,
             isRemoved,
-            overrideActive,
             verdict: skill.moderationVerdict,
             reasonCodes: skill.moderationReasonCodes,
-            summary: publicModerationSummary,
+            summary: skill.moderationSummary,
             engineVersion: skill.moderationEngineVersion,
             updatedAt: skill.moderationEvaluatedAt,
             sourceVersionId: skill.moderationSourceVersionId ?? null,
@@ -4622,7 +4510,7 @@ async function applySkillReportFinalAction(
     softDeletedAt: params.now,
     moderationStatus: "hidden",
     moderationReason: "manual.report",
-    moderationNotes: trimManualOverrideNote(params.note),
+    moderationNotes: trimModerationNote(params.note),
     hiddenAt: params.now,
     hiddenBy: params.actorUserId,
     unpublishedSlugReservedUntil: undefined,
@@ -4664,30 +4552,32 @@ async function applySkillAppealFinalAction(
 ) {
   if (params.action === "none") return;
 
-  const manualOverride = buildManualOverrideRecord({
-    note: params.note,
-    reviewerUserId: params.actorUserId,
-    updatedAt: params.now,
-  });
-  const moderationPatch = applyManualOverrideToSkillPatch({
-    basePatch: buildPreservedSkillModerationPatch(params.skill),
-    override: manualOverride,
+  const owner = params.skill.ownerUserId ? await ctx.db.get(params.skill.ownerUserId) : null;
+  const latestVersion = params.skill.latestVersionId
+    ? await ctx.db.get(params.skill.latestVersionId)
+    : null;
+  if (!latestVersion) {
+    throw new ConvexError("Cannot restore appeal: latest scanner version is unavailable.");
+  }
+  const moderationPatch = buildScannerModerationPatchFromVersion({
+    owner,
+    version: latestVersion,
     now: params.now,
   });
   const patch: Partial<Doc<"skills">> = {
-    ...moderationPatch,
-    manualOverride,
     softDeletedAt: undefined,
-    moderationStatus: "active",
-    hiddenAt: undefined,
-    hiddenBy: undefined,
-    lastReviewedAt: params.now,
+    ...moderationPatch,
     updatedAt: params.now,
   };
   const nextSkill = { ...params.skill, ...patch };
   await ctx.db.patch(params.skill._id, patch);
   await adjustGlobalPublicCountForSkillChange(ctx, params.skill, nextSkill);
-  await setSkillEmbeddingsSoftDeleted(ctx, params.skill._id, false, params.now);
+  await setSkillEmbeddingsSoftDeleted(
+    ctx,
+    params.skill._id,
+    nextSkill.moderationStatus === "hidden",
+    params.now,
+  );
 
   await ctx.db.insert("auditLogs", {
     actorUserId: params.actorUserId,
@@ -4698,7 +4588,7 @@ async function applySkillAppealFinalAction(
       slug: params.skill.slug,
       appealId: params.appealId,
       finalAction: params.action,
-      reason: manualOverride.note,
+      reason: trimModerationNote(params.note),
     },
     createdAt: params.now,
   });
@@ -8626,11 +8516,7 @@ export const escalateSkillByIdInternal = internalMutation({
       lastReviewedAt: moderationStatus === "hidden" ? now : undefined,
       updatedAt: now,
     };
-    const patch = applySkillManualOverrideToSkillPatch({
-      skill,
-      basePatch,
-      now,
-    });
+    const patch = basePatch;
     const nextSkill = { ...skill, ...patch };
     await ctx.db.patch(skill._id, patch);
     await adjustGlobalPublicCountForSkillChange(ctx, skill, nextSkill);
@@ -8725,7 +8611,7 @@ async function restoreSkillEmbeddingsVisibility(
   }
 }
 
-async function setSkillEmbeddingsSoftDeleted(
+export async function setSkillEmbeddingsSoftDeleted(
   ctx: MutationCtx,
   skillId: Id<"skills">,
   deleted: boolean,
@@ -9137,15 +9023,10 @@ export const restoreOwnedSkillsForModerationLiftBatchInternal = internalMutation
       const patch: Partial<Doc<"skills">> =
         latestVersion && hasCompletedScannerResult(latestVersion)
           ? {
-              ...applySkillManualOverrideToSkillPatch({
-                skill,
-                basePatch: buildScannerModerationPatchFromVersion({
-                  owner: user,
-                  version: latestVersion,
-                  now,
-                }),
+              ...buildScannerModerationPatchFromVersion({
+                owner: user,
+                version: latestVersion,
                 now,
-                stripUpdatedAt: true,
               }),
               updatedAt: now,
             }
@@ -9421,16 +9302,10 @@ export const updateVersionLlmAnalysisInternal = internalMutation({
     if (skill.latestVersionId !== version._id) {
       const owner = skill.ownerUserId ? await ctx.db.get(skill.ownerUserId) : null;
       const now = Date.now();
-      const basePatch = buildScannerModerationPatchFromVersion({
+      const patch = buildScannerModerationPatchFromVersion({
         owner,
         version: nextVersion,
         now,
-      });
-      const patch = applySkillManualOverrideToSkillPatch({
-        skill,
-        basePatch,
-        now,
-        stripUpdatedAt: true,
       });
       if (
         patch.moderationVerdict === "malicious" &&
@@ -9561,12 +9436,7 @@ export const approveSkillByHashInternal = internalMutation({
         unpublishedOriginalSlug: undefined,
         lastReviewedAt: nextModerationStatus === "hidden" ? now : undefined,
       };
-      const patch = applySkillManualOverrideToSkillPatch({
-        skill,
-        basePatch,
-        now,
-        stripUpdatedAt: true,
-      });
+      const patch = basePatch;
       const nextSkill = { ...skill, ...patch };
       await ctx.db.patch(skill._id, patch);
       await adjustGlobalPublicCountForSkillChange(ctx, skill, nextSkill);
@@ -9694,12 +9564,7 @@ export const escalateByVtInternal = internalMutation({
         | undefined,
     });
 
-    const patch = applySkillManualOverrideToSkillPatch({
-      skill,
-      basePatch,
-      now,
-      stripUpdatedAt: true,
-    });
+    const patch = basePatch;
     const nextSkill = { ...skill, ...patch };
     await ctx.db.patch(skill._id, patch);
     await adjustGlobalPublicCountForSkillChange(ctx, skill, nextSkill);
@@ -10070,7 +9935,7 @@ export async function revokeSkillVersionForUser(
   if (!slug) throw new ConvexError("Slug required");
   const versionName = args.version.trim();
   if (!versionName) throw new ConvexError("Version required");
-  const reason = trimManualOverrideNote(args.reason);
+  const reason = trimModerationNote(args.reason);
   const ownerHandle = args.ownerHandle?.trim().replace(/^@+/, "") || undefined;
 
   const resolved = await resolveSkillBySlugOrAliasForOwner(ctx, slug, ownerHandle, {
@@ -10125,15 +9990,10 @@ export async function revokeSkillVersionForUser(
     const owner = skill.ownerUserId ? await ctx.db.get(skill.ownerUserId) : null;
     Object.assign(
       plan.skillPatch,
-      applySkillManualOverrideToSkillPatch({
-        skill,
-        basePatch: buildScannerModerationPatchFromVersion({
-          owner,
-          version: replacement,
-          now,
-        }),
+      buildScannerModerationPatchFromVersion({
+        owner,
+        version: replacement,
         now,
-        stripUpdatedAt: true,
       }),
     );
   }
@@ -11024,104 +10884,19 @@ export const setSkillFeaturedForUserInternal = internalMutation({
   },
 });
 
+// Temporary compatibility endpoints for the first layer of the stacked rollout.
+// They fail closed until the UI callers are removed by the next layer.
 export const setSkillManualOverride = mutation({
-  args: {
-    skillId: v.id("skills"),
-    note: v.string(),
-  },
-  handler: async (ctx, args) => {
-    const { user } = await requireUser(ctx);
-    assertModerator(user);
-
-    const skill = await ctx.db.get(args.skillId);
-    if (!skill) throw new ConvexError("Skill not found");
-    if (skill.softDeletedAt || skill.moderationStatus === "removed") {
-      throw new ConvexError("Removed skills cannot be manually unflagged.");
-    }
-    if (!canApplySkillManualOverride(skill)) {
-      throw new ConvexError("Skill is not currently suspicious.");
-    }
-
-    const now = Date.now();
-    const manualOverride = buildManualOverrideRecord({
-      note: args.note,
-      reviewerUserId: user._id,
-      updatedAt: now,
-    });
-
-    const patch = applyManualOverrideToSkillPatch({
-      basePatch: buildPreservedSkillModerationPatch(skill),
-      override: manualOverride,
-      now,
-    });
-
-    await ctx.db.patch(skill._id, {
-      manualOverride,
-      ...patch,
-    });
-    const nextSkill = { ...skill, manualOverride, ...patch };
-    await adjustGlobalPublicCountForSkillChange(ctx, skill, nextSkill);
-
-    await ctx.db.insert("auditLogs", {
-      actorUserId: user._id,
-      action: "skill.manual_override.set",
-      targetType: "skill",
-      targetId: skill._id,
-      metadata: {
-        verdict: manualOverride.verdict,
-        note: manualOverride.note,
-        previousReason: skill.moderationReason ?? null,
-        previousVerdict: skill.moderationVerdict ?? null,
-      },
-      createdAt: now,
-    });
-
-    return { ok: true, manualOverride };
+  args: { skillId: v.id("skills"), note: v.string() },
+  handler: async () => {
+    throw new ConvexError("Manual skill overrides are no longer supported.");
   },
 });
 
 export const clearSkillManualOverride = mutation({
-  args: {
-    skillId: v.id("skills"),
-    note: v.string(),
-  },
-  handler: async (ctx, args) => {
-    const { user } = await requireUser(ctx);
-    assertModerator(user);
-
-    const skill = await ctx.db.get(args.skillId);
-    if (!skill) throw new ConvexError("Skill not found");
-    if (!skill.manualOverride) {
-      throw new ConvexError("Skill does not have a manual override.");
-    }
-
-    const now = Date.now();
-    const note = trimManualOverrideNote(args.note);
-    const previousOverride = skill.manualOverride;
-
-    await ctx.db.patch(skill._id, {
-      manualOverride: undefined,
-      updatedAt: now,
-    });
-
-    await ctx.db.insert("auditLogs", {
-      actorUserId: user._id,
-      action: "skill.manual_override.clear",
-      targetType: "skill",
-      targetId: skill._id,
-      metadata: {
-        note,
-        previousVerdict: previousOverride.verdict,
-        previousNote: previousOverride.note,
-        previousReviewerUserId: previousOverride.reviewerUserId,
-        previousUpdatedAt: previousOverride.updatedAt,
-      },
-      createdAt: now,
-    });
-
-    await syncSkillModerationFromLatestVersion(ctx, { ...skill, manualOverride: undefined }, now);
-
-    return { ok: true };
+  args: { skillId: v.id("skills"), note: v.string() },
+  handler: async () => {
+    throw new ConvexError("Manual skill overrides are no longer supported.");
   },
 });
 
@@ -11138,7 +10913,7 @@ export const setSoftDeleted = mutation({
     if (!skill) throw new Error("Skill not found");
 
     const now = Date.now();
-    const note = args.reason ? trimManualOverrideNote(args.reason) : undefined;
+    const note = args.reason ? trimModerationNote(args.reason) : undefined;
     if (!note) {
       throw new ConvexError(
         args.deleted ? "Hide reason is required." : "Restore reason is required.",
@@ -13330,11 +13105,7 @@ export const insertVersion = internalMutation({
       updatedAt: now,
       ...scannerModerationPatch,
     };
-    const patch = applySkillManualOverrideToSkillPatch({
-      skill,
-      basePatch,
-      now,
-    });
+    const patch = basePatch;
     const nextSkill = { ...skill, ...patch };
     await ctx.db.patch(skill._id, patch);
     await adjustGlobalPublicCountForSkillChange(ctx, skill, nextSkill);
@@ -13624,11 +13395,7 @@ export const publishPendingVersionInternal = internalMutation({
       updatedAt: now,
       ...scannerModerationPatch,
     };
-    const patch = applySkillManualOverrideToSkillPatch({
-      skill,
-      basePatch,
-      now,
-    });
+    const patch = basePatch;
     const nextSkill = { ...skill, ...patch };
 
     await ctx.db.patch(version._id, {
@@ -13926,9 +13693,12 @@ async function setSkillSoftDeletedByActor(
   //     `scanner.aggregate.clean`, or `scanner.<scanner>.clean` describe
   //     the skill's moderation state, not the cause of the current hide,
   //     so they must NOT block owner self-restore.
-  //   - If `hiddenBy` is somehow missing (legacy rows, manual override
-  //     pathways that cleared it), fail closed and route the caller to a
+  //   - If `hiddenBy` is somehow missing (legacy rows or incomplete
+  //     provenance), fail closed and route the caller to a
   //     moderator.
+  const moderationFlags = (skill.moderationFlags as string[] | undefined) ?? [];
+  const isMalwareBlocked =
+    moderationFlags.includes("blocked.malware") || skill.moderationVerdict === "malicious";
   if (!args.deleted && isOwner && !isModeratorOrAdmin) {
     // Defense-in-depth: regardless of `hiddenBy`/`moderationReason`
     // provenance, an owner must NEVER be able to restore a skill that any
@@ -13937,10 +13707,7 @@ async function setSkillSoftDeletedByActor(
     // escalation upgrades the verdict to malicious without rewriting
     // provenance fields (e.g. the VT-only escalation path intentionally
     // does not overwrite `moderationReason` to preserve the LLM verdict).
-    const moderationFlags = (skill.moderationFlags as string[] | undefined) ?? [];
-    const isMaliciousBlocked =
-      moderationFlags.includes("blocked.malware") || skill.moderationVerdict === "malicious";
-    if (isMaliciousBlocked) {
+    if (isMalwareBlocked) {
       throw new ConvexError(
         "Forbidden: This skill was blocked by automated malware detection and cannot be restored by the owner. Please contact a moderator.",
       );
@@ -13970,14 +13737,30 @@ async function setSkillSoftDeletedByActor(
     }
   }
 
+  let restoreVersion: Doc<"skillVersions"> | null = null;
+  let restoreOwner: Doc<"users"> | null = null;
+  if (!args.deleted) {
+    [restoreVersion, restoreOwner] = await Promise.all([
+      skill.latestVersionId ? ctx.db.get(skill.latestVersionId) : null,
+      skill.ownerUserId ? ctx.db.get(skill.ownerUserId) : null,
+    ]);
+    const hasSecurityLock =
+      isMalwareBlocked || isSkillSuspicious(skill) || isSkillReviewFlagged(skill);
+    if (!restoreVersion && (skill.latestVersionId || hasSecurityLock)) {
+      throw new ConvexError(
+        "Forbidden: This skill's scanner state cannot be reconstructed, so it cannot be restored.",
+      );
+    }
+  }
+
   const now = Date.now();
-  const note = args.reason ? trimManualOverrideNote(args.reason) : undefined;
+  const note = args.reason ? trimModerationNote(args.reason) : undefined;
   const slugReservedUntil =
     args.deleted && isOwner ? now + UNPUBLISHED_SLUG_RESERVATION_MS : undefined;
   const patch: Partial<Doc<"skills">> = {
     softDeletedAt: args.deleted ? now : undefined,
-    moderationStatus: args.deleted ? "hidden" : "active",
-    hiddenAt: args.deleted ? now : undefined,
+    moderationStatus: args.deleted || isMalwareBlocked ? "hidden" : "active",
+    hiddenAt: args.deleted || isMalwareBlocked ? now : undefined,
     hiddenBy: args.deleted ? args.userId : undefined,
     unpublishedSlugReservedUntil: slugReservedUntil,
     unpublishedSlugReleasedAt: undefined,
@@ -13986,32 +13769,17 @@ async function setSkillSoftDeletedByActor(
     updatedAt: now,
   };
   if (note) patch.moderationNotes = note;
-  if (!args.deleted && isModeratorOrAdmin && note) {
-    const manualOverride = buildManualOverrideRecord({
-      note,
-      reviewerUserId: user._id,
-      updatedAt: now,
-    });
+  if (!args.deleted && restoreVersion) {
     Object.assign(
       patch,
-      applyManualOverrideToSkillPatch({
-        basePatch: {
-          ...patch,
-          moderationReasonCodes: undefined,
-          moderationEvidence: undefined,
-          moderationSummary: undefined,
-          moderationEngineVersion: undefined,
-          moderationEvaluatedAt: undefined,
-          moderationSourceVersionId: undefined,
-        },
-        override: manualOverride,
+      buildScannerModerationPatchFromVersion({
+        owner: restoreOwner,
+        version: restoreVersion,
         now,
       }),
-      {
-        manualOverride,
-        moderationNotes: note,
-      },
+      { softDeletedAt: undefined, updatedAt: now },
     );
+    if (note) patch.moderationNotes = note;
   }
   // Data hygiene: when an owner/org manager deletes, reset any stale
   // `moderationReason` that may have survived from prior moderation metadata.
@@ -14026,7 +13794,12 @@ async function setSkillSoftDeletedByActor(
   await adjustGlobalPublicCountForSkillChange(ctx, skill, nextSkill);
   await adjustUserSkillStatsForSkillChange(ctx, skill, nextSkill);
 
-  await setSkillEmbeddingsSoftDeleted(ctx, skill._id, args.deleted, now);
+  await setSkillEmbeddingsSoftDeleted(
+    ctx,
+    skill._id,
+    Boolean(nextSkill.softDeletedAt || nextSkill.moderationStatus === "hidden"),
+    now,
+  );
 
   await ctx.db.insert("auditLogs", {
     actorUserId: args.userId,
@@ -14064,7 +13837,7 @@ export const hideSkillForSecurityRedactionInternal = internalMutation({
     if (skill.softDeletedAt) return { ok: true as const, changed: false as const };
 
     const now = Date.now();
-    const note = trimManualOverrideNote(args.reason);
+    const note = trimModerationNote(args.reason);
     if (!note) throw new Error("Reason required");
 
     const patch: Partial<Doc<"skills">> = {
