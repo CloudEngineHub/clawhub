@@ -10,8 +10,9 @@ import type { Doc, Id } from "./_generated/dataModel";
 import type { ActionCtx, MutationCtx, QueryCtx } from "./_generated/server";
 import { internalAction, internalMutation, internalQuery } from "./_generated/server";
 import { syncPackageSearchDigestForPackageId } from "./functions";
+import { adjustGlobalPublicSkillsCount, getPublicSkillVisibilityDelta } from "./lib/globalStats";
 import { derivePluginManifestSummary, normalizePackageName } from "./lib/packageRegistry";
-import { adjustPublisherStatsForSkillChange } from "./lib/publisherStats";
+import { adjustPublisherStatsForSkillChange, recomputePublisherStats } from "./lib/publisherStats";
 import {
   buildSkillDownloadBackfillPatch,
   calculatePublishedWeeks,
@@ -36,6 +37,7 @@ import { syncSkillSearchDigestForSkill } from "./lib/skillSearchDigest";
 import { readCanonicalStat } from "./lib/skillStats";
 import { adjustUserSkillStatsForSkillChange } from "./lib/userSkillStats";
 import schema from "./schema";
+import { buildScannerModerationPatchFromVersion, setSkillEmbeddingsSoftDeleted } from "./skills";
 
 const CANONICALIZE_CATALOG_METADATA_CONFIRM = "canonicalize-catalog-metadata";
 const APPLY_SKILL_INSTALL_BACKFILL_CONFIRM = "apply-skill-install-backfill";
@@ -43,6 +45,7 @@ const APPLY_NVIDIA_GITHUB_DOWNLOAD_BACKFILL_CONFIRM = "apply-nvidia-github-downl
 const BACKFILL_PLUGIN_MANIFEST_SUMMARIES_CONFIRM = "backfill-plugin-manifest-summaries";
 const RECOVER_SUSPICIOUS_PUBLISH_ATTEMPTS_CONFIRM = "recover-suspicious-publish-attempts";
 const APPLY_SKILL_HOURLY_STATS_BACKFILL_CONFIRM = "apply-skill-hourly-stats-backfill";
+const REMOVE_SKILL_MANUAL_OVERRIDES_CONFIRM = "remove-skill-manual-overrides";
 const SKILL_STAT_EVENTS_CURSOR_KEY = "skill_stat_events";
 const MAX_PENDING_SKILL_STAT_EVENTS_PER_SKILL = 1_000;
 const PLUGIN_PACKAGE_FAMILIES = ["code-plugin", "bundle-plugin"] as const;
@@ -88,6 +91,263 @@ export const migrations = new Migrations(components.migrations, {
   schema,
   defaultBatchSize: 25,
 });
+
+export function shouldPreserveSkillModerationLock(skill: Doc<"skills">) {
+  if (skill.softDeletedAt) return true;
+  if (skill.moderationStatus !== "hidden") return false;
+  const reason = skill.moderationReason;
+  return !(
+    reason === "pending.scan" ||
+    reason === "pending.scan.stale" ||
+    reason?.startsWith("scanner.") ||
+    reason?.startsWith("manual.override.")
+  );
+}
+
+function buildMissingVersionModerationPatch(
+  skill: Doc<"skills">,
+  now: number,
+): Partial<Doc<"skills">> {
+  if (
+    skill.moderationVerdict === "malicious" ||
+    skill.moderationFlags?.some((flag) => flag === "blocked.malware")
+  ) {
+    return {
+      moderationStatus: "hidden",
+      moderationReason: skill.moderationReason ?? "scanner.llm.malicious",
+      moderationNotes: skill.moderationNotes,
+      moderationFlags: skill.moderationFlags,
+      moderationVerdict: "malicious",
+      moderationReasonCodes: skill.moderationReasonCodes,
+      moderationEvidence: skill.moderationEvidence,
+      moderationSummary:
+        skill.moderationSummary ?? "Malicious scanner verdict retained; source version is missing.",
+      moderationEngineVersion: skill.moderationEngineVersion,
+      moderationEvaluatedAt: now,
+      moderationSourceVersionId: undefined,
+      isSuspicious: true,
+      hiddenAt: skill.hiddenAt ?? now,
+      hiddenBy: skill.hiddenBy,
+      lastReviewedAt: now,
+    };
+  }
+  return {
+    moderationStatus: "hidden",
+    moderationReason: "pending.scan.stale",
+    moderationNotes: undefined,
+    moderationFlags: undefined,
+    moderationVerdict: undefined,
+    moderationReasonCodes: ["review.scanner_source_missing"],
+    moderationEvidence: undefined,
+    moderationSummary: "Scanner source version is unavailable; hidden pending a new scan.",
+    moderationEngineVersion: undefined,
+    moderationEvaluatedAt: now,
+    moderationSourceVersionId: undefined,
+    isSuspicious: false,
+    hiddenAt: now,
+    hiddenBy: undefined,
+    lastReviewedAt: now,
+  };
+}
+
+export async function buildSkillModerationAfterOverrideRemoval(
+  ctx: Pick<MutationCtx, "db"> | Pick<QueryCtx, "db">,
+  skill: Doc<"skills">,
+  now: number,
+) {
+  const [latestVersion, owner] = await Promise.all([
+    skill.latestVersionId ? ctx.db.get(skill.latestVersionId) : null,
+    skill.ownerUserId ? ctx.db.get(skill.ownerUserId) : null,
+  ]);
+  return {
+    latestVersion: latestVersion?.version ?? null,
+    patch: latestVersion
+      ? buildScannerModerationPatchFromVersion({ owner, version: latestVersion, now })
+      : buildMissingVersionModerationPatch(skill, now),
+  };
+}
+
+export const removeSkillManualOverrides = migrations.define({
+  table: "skills",
+  batchSize: 25,
+  migrateOne: async (ctx, skill) => {
+    if (!skill.manualOverride) return;
+    if (shouldPreserveSkillModerationLock(skill)) {
+      await ctx.db.patch(skill._id, { manualOverride: undefined });
+      return;
+    }
+    const now = Date.now();
+    const { patch } = await buildSkillModerationAfterOverrideRemoval(ctx, skill, now);
+    const nextSkill = { ...skill, ...patch, manualOverride: undefined } as Doc<"skills">;
+    await ctx.db.patch(skill._id, { ...patch, manualOverride: undefined });
+
+    const globalDelta = getPublicSkillVisibilityDelta(skill, nextSkill);
+    await adjustGlobalPublicSkillsCount(ctx, globalDelta);
+    if (skill.ownerPublisherId) {
+      await ctx.db.patch(
+        skill.ownerPublisherId,
+        await recomputePublisherStats(ctx, skill.ownerPublisherId),
+      );
+    }
+    await adjustUserSkillStatsForSkillChange(ctx, skill, nextSkill);
+    await setSkillEmbeddingsSoftDeleted(
+      ctx,
+      skill._id,
+      Boolean(nextSkill.softDeletedAt || nextSkill.moderationStatus === "hidden"),
+      now,
+    );
+    await syncSkillSearchDigestForSkill(ctx, nextSkill);
+  },
+});
+
+type SkillManualOverrideCleanupOutcome =
+  | "preserved"
+  | "clean"
+  | "pending"
+  | "error"
+  | "review"
+  | "suspicious"
+  | "malicious";
+
+type SkillManualOverrideCleanupPreviewPage = {
+  scanned: number;
+  affected: number;
+  outcomes: Record<SkillManualOverrideCleanupOutcome, number>;
+  samples: Array<{
+    skillId: Id<"skills">;
+    slug: string;
+    latestVersion: string | null;
+    currentVerdict: string;
+    nextOutcome: SkillManualOverrideCleanupOutcome;
+  }>;
+  continueCursor: string;
+  isDone: boolean;
+};
+
+type SkillManualOverrideCleanupPreview = Omit<
+  SkillManualOverrideCleanupPreviewPage,
+  "continueCursor" | "isDone"
+>;
+
+function classifySkillManualOverrideCleanupOutcome(
+  patch: Partial<Doc<"skills">>,
+): SkillManualOverrideCleanupOutcome {
+  if (patch.moderationReason?.includes("error")) return "error";
+  if (patch.moderationReason?.startsWith("pending.")) return "pending";
+  if (patch.moderationVerdict === "malicious") return "malicious";
+  if (patch.moderationVerdict === "suspicious") return "suspicious";
+  if (patch.moderationReasonCodes?.some((code) => code.startsWith("review."))) return "review";
+  return "clean";
+}
+
+export const previewSkillManualOverrideCleanupPageInternal = internalQuery({
+  args: {
+    cursor: v.optional(v.string()),
+    pageSize: v.optional(v.number()),
+  },
+  handler: async (ctx, args): Promise<SkillManualOverrideCleanupPreviewPage> => {
+    const result = await ctx.db.query("skills").paginate({
+      cursor: args.cursor ?? null,
+      numItems: Math.min(Math.max(Math.trunc(args.pageSize ?? 250), 10), 500),
+    });
+    const outcomes: Record<SkillManualOverrideCleanupOutcome, number> = {
+      preserved: 0,
+      clean: 0,
+      pending: 0,
+      error: 0,
+      review: 0,
+      suspicious: 0,
+      malicious: 0,
+    };
+    const samples: SkillManualOverrideCleanupPreviewPage["samples"] = [];
+
+    for (const skill of result.page) {
+      if (!skill.manualOverride) continue;
+      if (shouldPreserveSkillModerationLock(skill)) {
+        outcomes.preserved += 1;
+        if (samples.length < 20) {
+          samples.push({
+            skillId: skill._id,
+            slug: skill.slug,
+            latestVersion: null,
+            currentVerdict: skill.moderationVerdict ?? "unknown",
+            nextOutcome: "preserved",
+          });
+        }
+        continue;
+      }
+      const { latestVersion, patch } = await buildSkillModerationAfterOverrideRemoval(
+        ctx,
+        skill,
+        Date.now(),
+      );
+      const nextOutcome = classifySkillManualOverrideCleanupOutcome(patch);
+      outcomes[nextOutcome] += 1;
+      if (samples.length < 20) {
+        samples.push({
+          skillId: skill._id,
+          slug: skill.slug,
+          latestVersion,
+          currentVerdict: skill.moderationVerdict ?? "unknown",
+          nextOutcome,
+        });
+      }
+    }
+
+    return {
+      scanned: result.page.length,
+      affected: Object.values(outcomes).reduce((sum, count) => sum + count, 0),
+      outcomes,
+      samples,
+      continueCursor: result.continueCursor,
+      isDone: result.isDone,
+    };
+  },
+});
+
+async function previewSkillManualOverrideCleanup(
+  ctx: Pick<ActionCtx, "runQuery">,
+): Promise<SkillManualOverrideCleanupPreview> {
+  let cursor: string | undefined;
+  const preview: SkillManualOverrideCleanupPreview = {
+    scanned: 0,
+    affected: 0,
+    outcomes: {
+      preserved: 0,
+      clean: 0,
+      pending: 0,
+      error: 0,
+      review: 0,
+      suspicious: 0,
+      malicious: 0,
+    },
+    samples: [],
+  };
+
+  do {
+    const page: SkillManualOverrideCleanupPreviewPage = await ctx.runQuery(
+      internal.migrations.previewSkillManualOverrideCleanupPageInternal,
+      { cursor, pageSize: 250 },
+    );
+    preview.scanned += page.scanned;
+    preview.affected += page.affected;
+    for (const outcome of [
+      "preserved",
+      "clean",
+      "pending",
+      "error",
+      "review",
+      "suspicious",
+      "malicious",
+    ] as const) {
+      preview.outcomes[outcome] += page.outcomes[outcome];
+    }
+    preview.samples.push(...page.samples.slice(0, 20 - preview.samples.length));
+    cursor = page.isDone ? undefined : page.continueCursor;
+  } while (cursor);
+
+  return preview;
+}
 
 async function requireSkillHourlyStatsBackfillState(ctx: Pick<MutationCtx, "db">) {
   const state = await ctx.db
@@ -1607,6 +1867,46 @@ export const runNvidiaGitHubDownloadBackfill = internalAction({
       dryRun,
       confirmRequired: dryRun ? APPLY_NVIDIA_GITHUB_DOWNLOAD_BACKFILL_CONFIRM : undefined,
       preview,
+    };
+  },
+});
+
+export const runSkillManualOverrideCleanup: ReturnType<typeof internalAction> = internalAction({
+  args: {
+    dryRun: v.optional(v.boolean()),
+    confirm: v.optional(v.string()),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{
+    ok: true;
+    dryRun: boolean;
+    confirmRequired?: string;
+    before: SkillManualOverrideCleanupPreview;
+    after: SkillManualOverrideCleanupPreview;
+  }> => {
+    const dryRun = args.dryRun !== false;
+    if (!dryRun && args.confirm !== REMOVE_SKILL_MANUAL_OVERRIDES_CONFIRM) {
+      throw new ConvexError(`Pass confirm="${REMOVE_SKILL_MANUAL_OVERRIDES_CONFIRM}" to apply.`);
+    }
+
+    const before = await previewSkillManualOverrideCleanup(ctx);
+    if (!dryRun) {
+      await runToCompletion(
+        ctx,
+        components.migrations,
+        internal.migrations.removeSkillManualOverrides,
+      );
+    }
+    const after = dryRun ? before : await previewSkillManualOverrideCleanup(ctx);
+
+    return {
+      ok: true as const,
+      dryRun,
+      confirmRequired: dryRun ? REMOVE_SKILL_MANUAL_OVERRIDES_CONFIRM : undefined,
+      before,
+      after,
     };
   },
 });
