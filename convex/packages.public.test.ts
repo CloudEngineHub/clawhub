@@ -2279,9 +2279,13 @@ function makeInsertReleaseCtx(
                   },
                 };
                 buildQuery?.(query);
-                if (indexName === "by_runtime_id") {
-                  const runtimeId = filters.get("runtimeId");
-                  const matches = runtimePackages.filter((pkg) => pkg.runtimeId === runtimeId);
+                if (
+                  indexName === "by_ownerUserId_ownerPublisherId_runtimeId_softDeletedAt" ||
+                  indexName === "by_ownerPublisherId_runtimeId_softDeletedAt"
+                ) {
+                  const matches = runtimePackages.filter((pkg) =>
+                    [...filters].every(([field, value]) => pkg[field] === value),
+                  );
                   return {
                     async *[Symbol.asyncIterator]() {
                       yield* matches;
@@ -18393,6 +18397,7 @@ describe("package scan backfill", () => {
       _id: "packageReleases:demo-1",
       packageId: "packages:demo",
       version: "1.0.0",
+      runtimeId: "demo.plugin",
       distTags: [],
       verification: { scanStatus: "clean" },
       createdAt: 1_600_000_000_000,
@@ -18421,7 +18426,7 @@ describe("package scan backfill", () => {
       _id: "packages:demo",
       ownerUserId: "users:owner",
       ownerPublisherId: "publishers:org",
-      runtimeId: "malicious.plugin",
+      runtimeId: "demo.plugin",
       sourceRepo: "openclaw/demo-malicious",
       latestReleaseId: "packageReleases:demo-2",
       tags: { latest: "packageReleases:demo-2" },
@@ -18515,7 +18520,7 @@ describe("package scan backfill", () => {
       "packages:demo",
       expect.objectContaining({
         latestReleaseId: "packageReleases:demo-1",
-        runtimeId: undefined,
+        runtimeId: "demo.plugin",
         sourceRepo: undefined,
         scanStatus: "clean",
         tags: { latest: "packageReleases:demo-1" },
