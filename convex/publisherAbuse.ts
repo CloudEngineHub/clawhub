@@ -91,7 +91,6 @@ const FAILED_SCORE_RUN_AUTOBAN_SKIP_NOTE =
 const PUBLISHER_ABUSE_AUTOBAN_SETTING_KEY = "publisherAbuseAutobanEnabled" as const;
 const PUBLISHER_TEMPORAL_ABUSE_MODEL_PREFIX = "publisher-abuse-temporal.";
 const LEGACY_PUBLISHER_TEMPORAL_ABUSE_MODEL_VERSIONS = ["publisher-abuse-temporal.v1"] as const;
-
 type TriageStatus = Doc<"publisherAbuseReviewNominations">["status"];
 type ScoreRun = Doc<"publisherAbuseScoreRuns">;
 type ScoreDoc = Doc<"publisherAbuseScores">;
@@ -260,11 +259,11 @@ export const listReviewDashboard = query({
         getPublisherAbuseReviewNominationCountSummary(ctx),
         getPublisherAbuseSignalCountSummary(ctx),
       ]);
-    const latestRun = newerPublisherAbuseRun(latestPressureRun, latestSignalRun);
-
     return {
-      latestRun: latestRun ? summarizePublisherAbuseRun(latestRun) : null,
+      latestRun: latestPressureRun ? summarizePublisherAbuseRun(latestPressureRun) : null,
       latestSignalRun: latestSignalRun ? summarizePublisherAbuseRun(latestSignalRun) : null,
+      latestSignalRunIsCurrentModel:
+        latestSignalRun?.modelVersion === PUBLISHER_TEMPORAL_ABUSE_MODEL_VERSION,
       pendingItems: [],
       pendingPotentialBanCandidateItems: [],
       pendingReviewItems: [],
@@ -463,6 +462,7 @@ function emptyPublisherAbuseReviewDashboard() {
   return {
     latestRun: null,
     latestSignalRun: null,
+    latestSignalRunIsCurrentModel: false,
     pendingItems: [],
     pendingPotentialBanCandidateItems: [],
     pendingReviewItems: [],
@@ -2840,7 +2840,10 @@ function newerPublisherAbuseRun(left: ScoreRun | null, right: ScoreRun | null) {
   return right.startedAt > left.startedAt ? right : left;
 }
 
-async function getLatestPublisherAbuseScoreRunForModel(ctx: QueryCtx, modelVersion: string) {
+async function getLatestPublisherAbuseScoreRunForModel(
+  ctx: Pick<QueryCtx | MutationCtx, "db">,
+  modelVersion: string,
+) {
   return await ctx.db
     .query("publisherAbuseScoreRuns")
     .withIndex("by_model_version_and_started_at", (q) => q.eq("modelVersion", modelVersion))
@@ -2848,7 +2851,7 @@ async function getLatestPublisherAbuseScoreRunForModel(ctx: QueryCtx, modelVersi
     .first();
 }
 
-async function getLatestPublisherAbuseSignalRun(ctx: QueryCtx) {
+export async function getLatestPublisherAbuseSignalRun(ctx: Pick<QueryCtx | MutationCtx, "db">) {
   const legacyTemporalPhases = [
     "collecting",
     "downloads_percentiles",
@@ -2893,6 +2896,13 @@ async function getLatestPublisherAbuseSignalRun(ctx: QueryCtx) {
     newerPublisherAbuseRun,
     taggedRun,
   );
+}
+
+export async function getRunningPublisherAbuseSignalRun(ctx: Pick<QueryCtx | MutationCtx, "db">) {
+  const run = await getLatestPublisherAbuseSignalRun(ctx);
+  return run?.status === "running" && run.modelVersion === PUBLISHER_TEMPORAL_ABUSE_MODEL_VERSION
+    ? run
+    : null;
 }
 
 async function getRecentResolvedPublisherAbuseReviewItems(
