@@ -63,23 +63,23 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
 
 - Publisher abuse scoring classifies bulk-publishing abuse for staff review and
   warning-first automatic enforcement. Scheduled pressure scoring runs daily.
-  Plain temporal dry runs are read-only. The scheduled temporal scan explicitly
-  opts into archived dry-run signal rows for the staff Signals tab. It persists
-  bounded source pages, exact percentile samples, and review candidates, then
+  Temporal traffic detection has two entrypoints: a read-only bounded preview
+  and one resumable scheduled pipeline that is the sole writer of signal rows.
+  The scheduled pipeline persists bounded source pages, exact percentile
+  samples, and candidate observations, then
   resumes through percentile and classification phases. Temporary scan rows
   expire after seven days. A failed step retries from the last persisted cursor
   with bounded backoff; any successfully persisted page resets the consecutive
   failure count. A watchdog treats fifteen minutes without persisted progress as
   a failed attempt. After five consecutive failed attempts, the run becomes
   terminal, retains the last error for the staff UI, emits the structured
-  `publisher_temporal_abuse_scan_failed` operator event, and sends a Hermit
-  alert to the configured ClawHub review channel.
+  `publisher_temporal_abuse_scan_failed` operator event.
   Moderators can start this same full signal pipeline from the staff Signals tab.
   New manual starts record the actor; requests made while a temporal scan is
   already active return that run without starting a competing worker. Stale
   recovery continues the same durable run instead of replacing it, and
   cursor-guarded writes prevent overlapping late workers from duplicating work.
-  Explicitly bounded manual scans remain diagnostic-only.
+  Explicitly bounded previews remain diagnostic-only.
   New scan indexes must ship in a staging-only release before any function
   queries them. Keep the indexes marked `staged: true`, deploy that schema,
   and wait until Convex reports every index ready. Only a later release may
@@ -100,11 +100,61 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
   exclusions apply only to review candidates, not to the platform benchmark.
   Partial scans must not archive signals or present their top-download slice as
   a platform percentile.
-- Flat-install temporal review signals are deliberately high-confidence:
-  sustained volume must exceed six times the platform 30-day download P99 and
-  have at most 5 installs; a spike must exceed the platform P99, reach at least
-  2,000 downloads in 7 days, and have at most 2 installs. These signals indicate
-  anomalous traffic for manual review, not publisher attribution.
+- Temporal download signals compare each skill with both its own frozen history
+  and the full active-skill population. A 7-day surge requires both its growth
+  multiple and its absolute downloads above the frozen baseline to exceed the
+  platform P99, regardless of install count. A standalone skill signal must also
+  reach at least 6,400 downloads in seven days or 7/30 of ten times the platform
+  30-day download P99, whichever is higher. The lower proportional floor of
+  7/30 of the sustained-traffic threshold is only enough to participate in a
+  publisher-wide synchronization check; it never creates a standalone skill
+  signal. These requirements prevent a tiny baseline or a low platform
+  percentile from turning modest isolated traffic into a signal. The stored
+  `download_spike_flat_installs` identifier is retained only so existing signal
+  rows keep their identity. Sustained traffic uses the 30 days before the current
+  30-day observation period as a frozen baseline, so a month-long rise cannot
+  raise its own comparison point. Each of the latest 14 days is compared with a
+  threshold derived from the platform P95 growth multiple and P95 absolute
+  excess; at least 10 days must exceed that threshold. The same skill must also
+  reach at least 6,400 downloads and at least ten times the platform 30-day
+  download P99, with at most 5 installs in the 14-day window. This
+  order-of-magnitude gate prevents broad crawler traffic from being presented
+  as a publisher-specific anomaly. This
+  catches traffic that arrives at a steady, exceptionally high rate after a
+  cold start instead of only detecting a spike on the day it begins. These
+  signals record anomalous traffic for staff visibility, not publisher
+  attribution or an enforcement decision.
+- The Signals tab is read-only telemetry. New signal rows do not have snooze,
+  dismissal, notification, ownership, or reply state. Legacy temporal
+  nominations remain readable and remain ineligible for autoban so existing
+  production records survive this rollout; the shared review tables continue
+  to serve aggregate pressure scoring. Removing legacy temporal records requires
+  a separate, explicitly approved production migration.
+- The completed temporal pipeline also checks for publisher-wide synchronization
+  among scan candidates that either have a sustained anomaly or clear the lower
+  proportional 7-day spike floor plus both platform P99 comparisons.
+  The synchronized group must cover at least 15% of the publisher's currently
+  published skills and more than half of its eligible scan candidates. Each
+  member's normalized trailing 60-day curve must have Pearson correlation of at
+  least 0.98 with the portfolio's median normalized curve, and the largest
+  seven-day rolling peak must be no more than 1.25 times the smallest. At least
+  two skills are required only because a trend comparison needs a group; there
+  is no fixed catalogue-size threshold. The full 60-day curve is captured during
+  the existing catalogue read and carried in the temporary scan candidate. Synchrony then
+  reads those candidates in bounded pages instead of querying each skill again.
+  A publisher above 8,000 synchrony candidates is skipped with the structured
+  `publisher_temporal_abuse_synchrony_owner_skipped` operator event, and the
+  scan continues with later publishers. This bounds one action without turning
+  a single oversized portfolio into a terminal full-scan failure.
+  Page size never
+  becomes an eligibility ceiling, and each publisher is evaluated once per run
+  even when its candidates span several source pages. Candidate reads use the
+  publisher-and-run index, so retained observations from older runs do not add
+  work to the current scan. Median-reference comparison keeps detector work near
+  linear as a portfolio grows. This produces one
+  `owner_synchronized_download_trends` signal for the publisher, not one extra
+  signal per skill. The majority and similar-peak requirements avoid treating a
+  small coincidental subset or shared direction alone as evidence.
 - Publisher abuse scoring must skip staff-linked and official publishers before
   nominations are created. Publisher abuse autoban must process pending
   `potential_ban_candidate` pressure nominations without waiting for the score
@@ -117,31 +167,19 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
 - Publisher abuse automatic bans must still use the account ban flow, including
   token revocation, owned listing hiding, audit logging, and the normal
   suspension/appeal email.
-- Publisher abuse Signals are manual-review telemetry only. They must not feed
-  automatic ban pressure. Staff can keep a signal `open`, `snoozed`, or
-  `dismissed`; there is no separate escalation state. Active snoozed and
-  dismissed signals stay out of the default Signals queue. Snoozing acknowledges
-  the current all-time download/install counters and starts a minimum quiet
-  period. The same rolling-window evidence must not reopen the signal after the
-  deadline. A snoozed signal reopens only when fresh post-snooze activity crosses
-  the lower repeat threshold: at least 1,500 downloads with at most 5 installs
-  for flat-install volume, or at least 500 downloads and 50 installs at a 10%
-  install/download ratio. Reopened repeat signals are elevated to high severity.
-  Staff may snooze or dismiss up to 50 selected open signals in one atomic
-  action. Bulk review must apply the same evidence checkpoint and write the same
-  per-signal review event as the corresponding single-signal action. The signal
-  inspector must show the selected skill's daily downloads and installs across
-  the same trailing 30-day window, loaded on demand from the bounded daily-stat
-  index so staff can judge whether the evidence is sustained or spiky.
-- Hermit owns Discord notification delivery for publisher abuse Signals.
-  ClawHub queues Hermit digests only for changed open signals: newly archived
-  signals, manual reopens, expired snoozes with qualifying fresh evidence, and
-  open signals whose evidence has materially increased since the previous
-  notification. A higher seen count alone is not a change. Material increases
-  use the same lower repeat thresholds as post-snooze recurrence, and the
-  notification checkpoint advances only when a notification is queued so
-  smaller changes accumulate across scans. Active snoozed or dismissed signals
-  must update their metric snapshot without notifying Hermit.
+- Publisher abuse Signals are read-only staff telemetry. They must not feed
+  automatic ban pressure, create a review queue, notify staff or publishers, or
+  expose workflow actions. The Signals view lists every stored observation and
+  shows bounded evidence in a detail drawer. For skill-level signals, the drawer
+  loads daily downloads and installs for the trailing 30 days from the bounded
+  daily-stat index. When a model version renames an equivalent signal type, it
+  must reuse the existing row so one observation keeps a stable identity across
+  detector versions.
+- Every `publisher-abuse-temporal.*` model version, including legacy rows,
+  remains ineligible for warning-first automatic enforcement. A future decision
+  to enforce temporal traffic signals requires an explicit policy and code
+  change; increasing a temporal score cannot silently cross the existing
+  pressure-model autoban boundary.
 - Aggregate publisher spam-abuse labels start at the 200-skill pivot. Below
   that pivot, publishers can contribute to the population baseline, but they
   cannot receive aggregate spam reason codes or be nominated by this score path.
