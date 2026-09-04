@@ -13,7 +13,10 @@ import {
   redactWorkerPublicText,
 } from "../lib/workerRedaction";
 import {
+  type AigAnalysis,
+  assertAigFilePathsHaveNoCompiledPython,
   type ClaimedJob,
+  normalizeAigAnalysis,
   type StoredLlmAnalysis,
   writeArtifactWorkspace,
 } from "./run-codex-scan-worker";
@@ -43,6 +46,7 @@ type ClaimedPrePublicationAttempt = {
     release?: Record<string, unknown>;
   };
   existingClawscanAnalysis?: StoredLlmAnalysis;
+  existingAigAnalysis?: AigAnalysis;
   checkClaimExpiresAt: number;
   createdAt: number;
 };
@@ -74,6 +78,7 @@ type TruffleHogResult = WorkerCheckResult & {
 type ClawScanResult = {
   check: WorkerCheckResult;
   analysis?: StoredLlmAnalysis;
+  aigAnalysis?: AigAnalysis;
 };
 
 type ProcessAttemptDeps = {
@@ -90,6 +95,29 @@ const DEFAULT_TRUFFLEHOG_IMAGE =
 const TRUFFLEHOG_SECRET_EXIT_CODE = 183;
 const MAX_TRUFFLEHOG_FINDINGS = 10;
 const MAX_PUBLIC_SUMMARY_CHARS = 600;
+const REQUIRED_SKILL_SCANNERS = ["clawscan-static", "skillspector", "aig"];
+const REQUIRED_PACKAGE_SCANNERS = ["clawscan-static", "skillspector"];
+const CHILD_RUNTIME_ENV_KEYS = [
+  "PATH",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+  "SYSTEMROOT",
+  "SystemRoot",
+  "WINDIR",
+  "COMSPEC",
+  "PATHEXT",
+] as const;
+// ClawScan's judge and A.I.G require these provider aliases. The pinned scanner
+// process is the trust boundary; never add worker tokens or ambient endpoints.
+const CLAWSCAN_PROVIDER_ENV_KEYS = [
+  "CODEX_API_KEY",
+  "DEFAULT_BASE_URL",
+  "DEFAULT_MODEL",
+  "LLM_API_KEY",
+  "OPENAI_API_KEY",
+] as const;
 const logger = createWorkerLogger({ name: "prepublication-worker" });
 
 export function parseArgs(args = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env) {
@@ -251,17 +279,14 @@ function parseTruffleHogFindings(stdout: string) {
 async function runCommand(
   command: string,
   args: string[],
-  options: { cwd: string; timeoutMs: number },
+  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number },
 ) {
   return await new Promise<{ code: number | null; stdout: string; stderr: string }>(
     (resolvePromise, reject) => {
       const child = spawn(command, args, {
         cwd: options.cwd,
         detached: process.platform !== "win32",
-        env: {
-          ...process.env,
-          NO_COLOR: "1",
-        },
+        env: options.env,
         stdio: ["ignore", "pipe", "pipe"],
       });
       let stdout = "";
@@ -311,6 +336,23 @@ async function runCommand(
   );
 }
 
+function restrictedChildEnvironment(
+  workspace: string,
+  passthroughKeys: readonly string[] = [],
+): NodeJS.ProcessEnv {
+  const childEnv: NodeJS.ProcessEnv = {
+    NO_COLOR: "1",
+    TEMP: workspace,
+    TMP: workspace,
+    TMPDIR: workspace,
+  };
+  for (const key of [...CHILD_RUNTIME_ENV_KEYS, ...passthroughKeys]) {
+    const value = process.env[key];
+    if (value !== undefined) childEnv[key] = value;
+  }
+  return childEnv;
+}
+
 export async function runNativeTruffleHog(workspace: string): Promise<TruffleHogResult> {
   const artifactDir = join(workspace, "artifact");
   const explicitCommand = truffleHogCommand();
@@ -333,6 +375,7 @@ export async function runNativeTruffleHog(workspace: string): Promise<TruffleHog
 
   const output = await runCommand(command, args, {
     cwd: workspace,
+    env: restrictedChildEnvironment(workspace),
     timeoutMs: truffleHogTimeoutMs(),
   });
   if (output.code === 0) {
@@ -408,10 +451,14 @@ function verdictToStoredStatus(verdict: string | undefined): StoredLlmAnalysis["
   return "pending";
 }
 
-function collectClawScanScannerFailures(scanners: Record<string, unknown> | undefined) {
-  if (!scanners) return [];
+function collectClawScanScannerFailures(
+  scanners: Record<string, unknown> | undefined,
+  scannerSet: readonly string[],
+) {
   const failures: string[] = [];
-  for (const [scanner, value] of Object.entries(scanners)) {
+  for (const scanner of scannerSet) {
+    const value = scanners?.[scanner];
+    if (value === undefined) continue;
     const scannerRecord = asRecord(value);
     const status = readString(scannerRecord, ["status"]) ?? "unknown";
     if (status !== "completed") failures.push(`${scanner}=${status}`);
@@ -419,8 +466,12 @@ function collectClawScanScannerFailures(scanners: Record<string, unknown> | unde
   return failures;
 }
 
-function storedAnalysisFromClawScanArtifact(artifact: unknown): {
+function storedAnalysisFromClawScanArtifact(
+  artifact: unknown,
+  targetKind: ClaimedJob["job"]["targetKind"],
+): {
   analysis?: StoredLlmAnalysis;
+  aigAnalysis?: AigAnalysis;
   error?: string;
 } {
   const record = asRecord(artifact);
@@ -428,7 +479,10 @@ function storedAnalysisFromClawScanArtifact(artifact: unknown): {
   const result = asRecord(judge?.result);
   const judgeStatus = readString(judge, ["status"]);
   const judgeError = readString(judge, ["error"]);
-  const scannerFailures = collectClawScanScannerFailures(asRecord(record?.scanners));
+  const requireAig = targetKind !== "packageRelease";
+  const scanners = asRecord(record?.scanners);
+  const requiredScanners = requireAig ? REQUIRED_SKILL_SCANNERS : REQUIRED_PACKAGE_SCANNERS;
+  const scannerFailures = collectClawScanScannerFailures(scanners, requiredScanners);
   if (scannerFailures.length > 0) {
     return { error: `ClawScan scanner did not complete: ${scannerFailures.join(", ")}` };
   }
@@ -438,6 +492,14 @@ function storedAnalysisFromClawScanArtifact(artifact: unknown): {
         `ClawScan judge status was ${judgeStatus ?? "missing"}`,
         ...(judgeError ? [judgeError] : []),
       ].join(": "),
+    };
+  }
+  const missingScanners = requiredScanners.filter((scanner) => scanners?.[scanner] === undefined);
+  if (missingScanners.length > 0) {
+    return {
+      error: `ClawScan scanner did not complete: ${missingScanners
+        .map((scanner) => `${scanner}=missing`)
+        .join(", ")}`,
     };
   }
   const verdict = readString(result, ["verdict", "status"]);
@@ -451,9 +513,23 @@ function storedAnalysisFromClawScanArtifact(artifact: unknown): {
   const guidance = readString(result, ["guidance"]);
   const model = readString(result, ["model"]);
   const summary = readString(result, ["summary"]);
+  const checkedAt = Date.now();
+  let aigAnalysis: AigAnalysis | undefined;
+  if (requireAig) {
+    const aig = asRecord(asRecord(record?.scanners)?.aig);
+    if (!aig || aig.raw === undefined) {
+      return { error: "ClawScan aig scanner output was missing" };
+    }
+    const rawAig = typeof aig.raw === "string" ? aig.raw : JSON.stringify(aig.raw);
+    aigAnalysis = normalizeAigAnalysis(rawAig, checkedAt);
+    if (aigAnalysis.status === "error") {
+      return { error: aigAnalysis.error ?? "A.I.G returned unusable scanner output" };
+    }
+  }
   return {
+    aigAnalysis,
     analysis: {
-      checkedAt: Date.now(),
+      checkedAt,
       status: verdictToStoredStatus(verdict),
       verdict,
       ...(confidence ? { confidence } : {}),
@@ -506,6 +582,9 @@ export async function runNativeClawScan(
 ): Promise<ClawScanResult> {
   const artifactPath = join(workspace, "clawscan-result.json");
   const target = await resolveNativeClawScanTarget(workspace, job);
+  if (job.job.targetKind !== "packageRelease") {
+    assertAigFilePathsHaveNoCompiledPython(job.target.files?.map((file) => file.path) ?? []);
+  }
   const command = clawScanCommand();
   const args = [target, "--profile", "clawhub", "--output", artifactPath];
   const sandbox = process.env.PREPUBLICATION_CLAWSCAN_SANDBOX?.trim();
@@ -517,6 +596,7 @@ export async function runNativeClawScan(
 
   const output = await runCommand(command, args, {
     cwd: workspace,
+    env: restrictedChildEnvironment(workspace, CLAWSCAN_PROVIDER_ENV_KEYS),
     timeoutMs: clawScanTimeoutMs(),
   });
   if (output.code !== 0) {
@@ -531,7 +611,7 @@ export async function runNativeClawScan(
   }
 
   const raw = await readFile(artifactPath, "utf8");
-  const parsed = storedAnalysisFromClawScanArtifact(JSON.parse(raw) as unknown);
+  const parsed = storedAnalysisFromClawScanArtifact(JSON.parse(raw) as unknown, job.job.targetKind);
   if (parsed.error || !parsed.analysis) {
     return {
       check: {
@@ -542,6 +622,7 @@ export async function runNativeClawScan(
   }
   return {
     analysis: parsed.analysis,
+    aigAnalysis: parsed.aigAnalysis,
     check: clawScanCheckResult(parsed.analysis),
   };
 }
@@ -561,6 +642,7 @@ async function completeAttempt(
   trufflehog: WorkerCheckResult,
   clawscan: WorkerCheckResult,
   clawscanAnalysis?: StoredLlmAnalysis,
+  aigAnalysis?: AigAnalysis,
 ) {
   return await client.action(api.publishAttempts.completePrePublicationChecks, {
     token,
@@ -570,6 +652,7 @@ async function completeAttempt(
     trufflehog: checkResultForConvex(trufflehog),
     clawscan: checkResultForConvex(clawscan),
     ...(clawscanAnalysis ? { clawscanAnalysis } : {}),
+    ...(aigAnalysis ? { aigAnalysis } : {}),
   });
 }
 
@@ -593,6 +676,8 @@ export async function processPrePublicationAttempt(
           status: "clean",
           summary: "Pre-publication ClawScan already passed.",
         },
+        undefined,
+        attempt.existingAigAnalysis,
       );
       logger.info(
         {
@@ -628,6 +713,9 @@ export async function processPrePublicationAttempt(
   try {
     const job = buildSyntheticScanJob(attempt);
     await writeWorkspace(job, workspace);
+    if (attempt.kind === "skill") {
+      assertAigFilePathsHaveNoCompiledPython(attempt.files.map((file) => file.path));
+    }
     const trufflehog = await runTruffleHog(workspace);
     if (trufflehog.status === "blocked") {
       truffleHogBlocked = true;
@@ -659,8 +747,18 @@ export async function processPrePublicationAttempt(
 
     let clawscan: WorkerCheckResult;
     let clawscanAnalysis: StoredLlmAnalysis | undefined;
-    if (attempt.existingClawscanAnalysis) {
-      clawscanAnalysis = attempt.existingClawscanAnalysis;
+    let aigAnalysis: AigAnalysis | undefined;
+    const existingClawscanAnalysis = attempt.existingClawscanAnalysis;
+    const existingAigAnalysis = attempt.existingAigAnalysis;
+    if (
+      existingClawscanAnalysis &&
+      (attempt.kind === "package" ||
+        (existingAigAnalysis &&
+          existingAigAnalysis.status !== "error" &&
+          existingAigAnalysis.checkedAt === existingClawscanAnalysis.checkedAt))
+    ) {
+      clawscanAnalysis = existingClawscanAnalysis;
+      aigAnalysis = attempt.kind === "skill" ? existingAigAnalysis : undefined;
       clawscan = clawScanCheckResult(clawscanAnalysis);
       logger.info(
         {
@@ -674,6 +772,7 @@ export async function processPrePublicationAttempt(
       try {
         const review = await runClawScan(job, workspace);
         clawscanAnalysis = review.analysis;
+        aigAnalysis = review.aigAnalysis;
         clawscan = review.check;
       } catch (error) {
         clawscan = {
@@ -691,6 +790,7 @@ export async function processPrePublicationAttempt(
       trufflehog,
       clawscan,
       clawscanAnalysis,
+      aigAnalysis,
     );
     logger.info(
       {
