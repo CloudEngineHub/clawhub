@@ -770,6 +770,24 @@ code-plugin packages only.
 API shape rule:
 
 - shared `/packages` endpoints are for discovery and shared metadata
+- Normal plugin/package search and browse return only public, non-deleted,
+  non-blocked packages with a published latest version. The package's
+  `latestVersionSummary.version` and its search digest's `latestVersion` are
+  the publication markers used on these read paths; reservations and pending
+  first publications have neither. These filters apply before result limits
+  and pagination, including featured, category, topic, and sorted discovery.
+- Authentication, package ownership, and publisher membership must not widen
+  normal catalog visibility. A private reservation such as `whatsapp` must
+  never accompany the published `@openclaw/whatsapp` in normal discovery.
+  Owner management/detail access and explicitly staff-only moderation APIs
+  retain their separate authorization rules and may inspect withheld records.
+- Explicit `channel=private` list/search requests may return published private
+  packages the authenticated caller is authorized to read; reservations,
+  unpublished, deleted, and blocked packages remain excluded.
+- Public plugin counts and topic suggestions use the same public publication
+  criteria. After deploying this eligibility change, the existing
+  `statsMaintenance:updateGlobalStatsAction` recount repairs historical totals;
+  the daily global-stats cron also performs this reconciliation.
 - family-specific endpoints are allowed for install and publish semantics
 - code-plugin download/install endpoints must not be overloaded for bundle
   plugins
