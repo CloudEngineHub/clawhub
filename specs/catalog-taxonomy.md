@@ -3,13 +3,25 @@
 ## Categories
 
 - Skills and plugins use separate controlled slug registries from `clawhub-schema`.
-- Category slugs name one concept. Plugin categories mirror contribution slots; skill categories
-  describe user intent.
+- Category slugs name one concept. Plugin categories combine seven core configuration surfaces
+  (Channels, Models, Agent runtimes, Memory, Context, Voice, Web) with product uses and capabilities.
+- The remaining active plugin categories are Media, Security, Integrations, Developer tools,
+  Infrastructure, Documents & files, Inbox & collaboration, Productivity, Scheduling,
+  Finance & payments, Sales & marketing, Data & analytics, Agent orchestration, Research, and Other.
+- Tools, Runtime, and Gateway remain accepted for published metadata and old links, but are absent
+  from the active browse registry. Compatibility never maps all Tools plugins to Integrations.
 - Skills store up to three category slugs. Unknown slugs are rejected, and `other` is removed when
   a specific skill category is present.
-- Plugins may declare an ordered `categories` array in `openclaw.plugin.json`. When present, it must
-  contain one to three exact controlled plugin slugs with no duplicates; the first value is primary.
-- Plugin category precedence is package declaration, then ClawHub manifest-contribution inference,
+- New plugin releases may declare `categories` in `openclaw.plugin.json`. When present, the array
+  contains exactly one controlled slug describing the primary reason to install the plugin.
+  Generated assignments and bundled manifests also contain exactly one category. Readers and the
+  refresh preserve actual one-to-three-category declarations in previously published artifacts.
+- The active registry has 22 categories. `agent-runtimes` uses the `bot` icon after Models. It covers
+  execution engines and backends that run the agent loop and manage native sessions. Context
+  covers active-context assembly and compaction; Agent orchestration covers coordination and
+  delegation. Session mirroring or locks alone do not make a plugin an execution engine.
+  Legacy `runtime` remains readable and is not automatically mapped to Agent runtimes.
+- Plugin category precedence is package declaration, then ClawHub model classification,
   then `other`. Omission is accepted. Invalid declarations reject publication instead of falling
   through to inference.
 - Each plugin release stores the effective categories for that exact package version. A promoted
@@ -18,8 +30,9 @@
   Publishers change them by publishing a new package version.
 - Backports and non-latest plugin releases do not replace current categories.
 - Capability tags are not taxonomy inputs.
-- Existing plugin releases are not backfilled. Exact-version category lookup returns no categories
-  for legacy releases that predate release-level category storage.
+- A reviewed one-time refresh covers only each plugin's latest published release and package
+  projection. Older releases are unchanged; exact-version lookup remains null for historical
+  releases without stored category metadata.
 - Package-level `categories` is the canonical latest-version source for detail, profile, API, and
   discovery reads. Release-level manifest summaries are the canonical exact-version source.
 
@@ -76,6 +89,53 @@
 - The endpoint does not derive or backfill metadata at request time.
 
 ## Follow-Up
+
+The product-category refresh uses the same bounded static-evidence classifier as publication.
+It never executes plugin code, imports another marketplace, or filters by license. Explicit
+manifest declarations win; canonical database categories alone do not establish authorship.
+Failed model requests produce an observable Other fallback and do not reject valid publication.
+
+`pluginCategoryRefreshes` retains separate review runs with before/after category state. The
+preview action handles one bounded page and returns a resume cursor. Repeating a run never
+replaces its rows. Accept only inspected row IDs; failed classifications must be refreshed before
+acceptance. The migrations component applies accepted rows, checking release identity, artifact
+evidence, and both package/release category state again. Category indexes change in the same
+transaction. Guarded rollback refuses to overwrite state changed after apply.
+
+Bundled assignments are pinned to a reviewed OpenClaw inventory. Registry matching requires the
+exact package name, manifest plugin ID, OpenClaw source repository, and the OpenClaw organization
+publisher. Matching latest registry entries receive reviewed category metadata without modifying
+archived source bytes. Missing package identity is not guessed. This is independent of the
+registry's `bundle-plugin` package format.
+
+Production sequence: deploy compatible readers, update bundled declarations and publication,
+generate and inspect a new preview, then explicitly accept and apply the selected rows. Keep run
+IDs and verification evidence; remove one-off apply tooling only after verified production
+completion. The retained journal is the audit/rollback record.
+
+Operator entry points (run only against the deliberately selected deployment):
+
+- `pluginCategoryRefresh:preview {"runId":"plugin-single-category-v3-prod","batchSize":10}` returns
+  a cursor and bounded skip/failure diagnostics. Pass each returned cursor to the next call;
+  pause between calls. `pluginCategoryRefresh:list` lists that run with normal pagination.
+- `pluginCategoryRefresh:accept` accepts at most 100 inspected row IDs with
+  `confirm: "apply-plugin-category-refresh"`. Accept a small pilot first, then small waves;
+  verify browse results and pause between waves to limit reactive traffic.
+- `migrations:applyAcceptedPluginCategoryRefreshes {"dryRun":true}` rehearses one batch
+  without persisting changes. `migrations:run` with
+  `fn: "migrations:applyAcceptedPluginCategoryRefreshes"` applies accepted rows in batches
+  of ten. Use the component's reset option when starting a new wave after completion;
+  do not reset an in-progress cursor when resuming that wave.
+- `pluginCategoryRefresh:rollback` accepts one applied journal ID with
+  `confirm: "rollback-plugin-category-refresh"`. Preserve the journal and verification output.
+
+Classification uses `OPENAI_API_KEY` and defaults to `gpt-5.6-luna`, with a dedicated
+`OPENAI_PLUGIN_CATEGORY_MODEL` override independent of skill-summary configuration. The current
+classifier revision is `plugin-single-category-v3`; superseded generated previews cannot be
+accepted or applied. The model receives all 22 purpose definitions and must return exactly one
+category. Missing credentials, timeouts, and
+invalid output are recorded as failed fallback classifications. They cannot be accepted by the
+backfill. Retry those packages under a new run ID after resolving the failure.
 
 Corpus classification was a one-time operator-run phase:
 
