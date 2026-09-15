@@ -63,6 +63,10 @@ import {
   getPackageTrustReasons,
   resolvePackageReleaseScanStatus,
 } from "../lib/packageSecurity";
+import {
+  buildPluginSearchObservation,
+  parsePluginSearchSource,
+} from "../lib/pluginSearchObservations";
 import type { PublicPublisher } from "../lib/public";
 import {
   getClawPackSizeError,
@@ -194,6 +198,9 @@ const internalRefs = internal as unknown as {
     requestPackageRescanForUserInternal: unknown;
     enqueueBulkPackageRescanBatchForAdminInternal: unknown;
     getBulkPackageRescanBatchStatusForAdminInternal: unknown;
+  };
+  pluginSearchObservations: {
+    recordInternal: unknown;
   };
   publishAttempts: {
     getPackagePublishAttemptStatusInternal: unknown;
@@ -3985,7 +3992,11 @@ async function getSkillVersionForRequest(
 async function searchPackages(
   ctx: ActionCtx,
   request: Request,
-  options?: { includeSkills?: boolean; pluginFamilies?: Array<"code-plugin" | "bundle-plugin"> },
+  options?: {
+    includeSkills?: boolean;
+    pluginFamilies?: Array<"code-plugin" | "bundle-plugin">;
+    recordPluginSearch?: boolean;
+  },
 ) {
   const rate = await applyRateLimit(ctx, request, "read");
   if (!rate.ok) return rate.response;
@@ -4137,7 +4148,35 @@ async function searchPackages(
       .sort(compareCatalogSearchEntries)
       .slice(0, limit);
   }
-  return json({ results: results.map(toPublicCatalogSearchEntry) }, 200, rate.headers);
+  const publicResults = results.map(toPublicCatalogSearchEntry);
+  if (
+    options?.recordPluginSearch &&
+    !request.signal.aborted &&
+    (!family || family === "code-plugin" || family === "bundle-plugin")
+  ) {
+    const observation = buildPluginSearchObservation({
+      source: parsePluginSearchSource(url.searchParams.get("searchSource")),
+      query: queryText,
+      category,
+      topic,
+      results: publicResults,
+    });
+    if (observation) {
+      try {
+        await runMutationRef(
+          ctx,
+          internalRefs.pluginSearchObservations.recordInternal,
+          observation,
+        );
+      } catch {
+        // Search demand is optional product analytics. Never expose or log the raw query on failure.
+        console.error("[plugin-search-observations] failed to record marked search", {
+          source: observation.source,
+        });
+      }
+    }
+  }
+  return json({ results: publicResults }, 200, rate.headers);
 }
 
 export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Request) {
@@ -4939,6 +4978,7 @@ export async function pluginsGetRouterV1Handler(ctx: ActionCtx, request: Request
     return await searchPackages(ctx, request, {
       includeSkills: false,
       pluginFamilies: ["code-plugin", "bundle-plugin"],
+      recordPluginSearch: true,
     });
   }
   return text("Not found", 404);
