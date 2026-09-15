@@ -24,7 +24,7 @@ import {
   type PackageVerificationTier,
 } from "clawhub-schema";
 import { getPage, type IndexKey } from "convex-helpers/server/pagination";
-import { paginationOptsValidator } from "convex/server";
+import { paginationOptsValidator, type PaginationOptions } from "convex/server";
 import { ConvexError, v, type Value } from "convex/values";
 import semver from "semver";
 import { internal } from "./_generated/api";
@@ -1383,45 +1383,34 @@ function toManagerPackageRelease(release: Doc<"packageReleases">, family: Packag
 async function paginatePublishedPackageReleases(
   ctx: QueryCtx,
   packageId: Id<"packages">,
-  paginationOpts: { cursor: string | null; numItems: number },
+  paginationOpts: PaginationOptions,
 ) {
-  const targetCount = Math.max(1, Math.min(paginationOpts.numItems, MAX_PUBLIC_LIST_PAGE_SIZE));
-  const page: Doc<"packageReleases">[] = [];
-  let cursor = paginationOpts.cursor;
-  let isDone = false;
-  let continueCursor = "";
-  let remainingScanBudget = Math.max(
-    targetCount,
-    Math.min(
-      MAX_PUBLIC_LIST_FILTER_SCAN_DOCUMENTS,
-      targetCount * MAX_PUBLIC_LIST_FILTER_SCAN_PAGES,
-    ),
+  const numItems = Math.max(1, Math.min(paginationOpts.numItems, MAX_PUBLIC_LIST_PAGE_SIZE));
+  const scanLimit = Math.min(
+    MAX_PUBLIC_LIST_FILTER_SCAN_DOCUMENTS,
+    numItems * MAX_PUBLIC_LIST_FILTER_SCAN_PAGES,
   );
-
-  for (let scanPages = 0; scanPages < MAX_PUBLIC_LIST_FILTER_SCAN_PAGES; scanPages += 1) {
-    if (page.length >= targetCount || isDone || remainingScanBudget <= 0) break;
-    const pageSize = Math.min(remainingScanBudget, targetCount - page.length);
-    const result = await ctx.db
-      .query("packageReleases")
-      .withIndex("by_package_active_created", (q) =>
-        q.eq("packageId", packageId).eq("softDeletedAt", undefined),
-      )
-      .order("desc")
-      .paginate({ cursor, numItems: pageSize });
-    remainingScanBudget -= pageSize;
-    cursor = result.continueCursor;
-    continueCursor = result.continueCursor;
-    isDone = result.isDone;
-    for (const release of result.page) {
-      if (isPublishedPackageRelease(release)) {
-        page.push(release);
-        if (page.length >= targetCount) break;
-      }
-    }
-    if (result.page.length === 0) break;
-  }
-
-  return { page, isDone, continueCursor: isDone ? "" : continueCursor };
+  // Convex allows one native pagination call per query, including filtered pages.
+  return await ctx.db
+    .query("packageReleases")
+    .withIndex("by_package_active_created", (q) =>
+      q.eq("packageId", packageId).eq("softDeletedAt", undefined),
+    )
+    .filter((q) =>
+      q.and(
+        q.eq(q.field("ownerDeletedAt"), undefined),
+        q.or(
+          q.eq(q.field("publicationStatus"), undefined),
+          q.eq(q.field("publicationStatus"), "published"),
+        ),
+      ),
+    )
+    .order("desc")
+    .paginate({
+      ...paginationOpts,
+      numItems,
+      maximumRowsRead: Math.min(paginationOpts.maximumRowsRead ?? scanLimit, scanLimit),
+    });
 }
 
 function packageArtifactSummary(
