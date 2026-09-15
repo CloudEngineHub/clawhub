@@ -28,7 +28,10 @@ import {
   routeToBannedAccountPage,
 } from "../lib/authErrorMessage";
 import { gravatarUrl } from "../lib/gravatar";
-import { navigateWithManualPluginSearch } from "../lib/manualPluginSearch";
+import {
+  navigateWithManualCatalogSearch,
+  type ManualCatalogSearch,
+} from "../lib/manualCatalogSearch";
 import { PRIMARY_NAV_ITEMS, SECONDARY_NAV_ITEMS } from "../lib/nav-items";
 import { buildPublisherProfileHref, buildSkillDetailHref } from "../lib/ownerRoute";
 import { buildPluginDetailHref, displayPluginPackageName } from "../lib/pluginRoutes";
@@ -43,7 +46,6 @@ import {
   type UnifiedCreatorResult,
   type UnifiedPluginResult,
   type UnifiedSkillResult,
-  type ManualPluginSearch,
 } from "../lib/useUnifiedSearch";
 import { MarketplaceIcon } from "./MarketplaceIcon";
 import { OfficialBadge } from "./OfficialBadge";
@@ -143,7 +145,7 @@ export default function Header() {
     isAuthenticated && me ? {} : "skip",
   );
   const [navSearchQuery, setNavSearchQuery] = useState("");
-  const manualPluginSearchRef = useRef<ManualPluginSearch | null>(null);
+  const manualCatalogSearchRef = useRef<ManualCatalogSearch | null>(null);
   const [typeaheadOpen, setTypeaheadOpen] = useState(false);
   const [typeaheadActiveIndex, setTypeaheadActiveIndex] = useState(0);
   const [mobileSearchOpen, setMobileSearchOpen] = useState(false);
@@ -164,8 +166,9 @@ export default function Header() {
     creatorResults,
     isSearching: typeaheadSearching,
     pluginSearchError,
+    skillSearchError,
   } = useUnifiedSearch(navSearchQuery, "all", {
-    manualPluginSearch: manualPluginSearchRef.current,
+    manualCatalogSearch: manualCatalogSearchRef.current,
     detectPluginHasMore: false,
     debounceMs: 180,
     enabled: typeaheadOpen && hasNavSearchQuery,
@@ -289,22 +292,22 @@ export default function Header() {
   const handleNavSearchChange = (value: string) => {
     const query = value.trim();
     if (query !== trimmedNavSearchQuery) {
-      manualPluginSearchRef.current = { query, consumed: false };
+      manualCatalogSearchRef.current = { query, consumed: {} };
     }
     setNavSearchQuery(value);
     setTypeaheadOpen(true);
   };
 
+  const openSearchResults = (type?: TypeaheadSection) => {
+    void navigateWithManualCatalogSearch(manualCatalogSearchRef.current, () =>
+      navigate({ to: "/search", search: { q: trimmedNavSearchQuery, type } }),
+    );
+  };
+
   const handleNavSearch = (e: React.FormEvent) => {
     e.preventDefault();
-    const q = navSearchQuery.trim();
-    if (!q) return;
-    void navigateWithManualPluginSearch(manualPluginSearchRef.current, () =>
-      navigate({
-        to: "/search",
-        search: { q, type: undefined },
-      }),
-    );
+    if (!trimmedNavSearchQuery) return;
+    openSearchResults();
     setNavSearchQuery("");
     setTypeaheadOpen(false);
     setMobileSearchOpen(false);
@@ -321,10 +324,7 @@ export default function Header() {
       }
       const resultOwnerHandle = item.result.ownerHandle?.trim();
       if (!resultOwnerHandle) {
-        void navigate({
-          to: "/search",
-          search: { q: trimmedNavSearchQuery, type: "skills" },
-        });
+        openSearchResults("skills");
         setNavSearchQuery("");
         setTypeaheadOpen(false);
         setMobileSearchOpen(false);
@@ -342,10 +342,7 @@ export default function Header() {
     } else if (item.kind === "creator") {
       const publisherHandle = item.result.creator.handle.trim();
       if (!publisherHandle) {
-        void navigate({
-          to: "/search",
-          search: { q: trimmedNavSearchQuery, type: "creators" },
-        });
+        openSearchResults("creators");
         setNavSearchQuery("");
         setTypeaheadOpen(false);
         setMobileSearchOpen(false);
@@ -355,10 +352,7 @@ export default function Header() {
         to: buildPublisherProfileHref(publisherHandle),
       });
     } else {
-      void navigate({
-        to: "/search",
-        search: { q: trimmedNavSearchQuery, type: item.section },
-      });
+      openSearchResults(item.section);
     }
     setNavSearchQuery("");
     setTypeaheadOpen(false);
@@ -575,6 +569,7 @@ export default function Header() {
                   activeIndex={typeaheadActiveIndex}
                   loading={typeaheadSearching}
                   pluginSearchError={pluginSearchError}
+                  skillSearchError={skillSearchError}
                   onHoverItem={setTypeaheadActiveIndex}
                   onSelectItem={navigateToTypeaheadItem}
                   creatorItems={typeaheadCreatorItems}
@@ -786,6 +781,7 @@ export default function Header() {
                 activeIndex={typeaheadActiveIndex}
                 loading={typeaheadSearching}
                 pluginSearchError={pluginSearchError}
+                skillSearchError={skillSearchError}
                 onHoverItem={setTypeaheadActiveIndex}
                 onSelectItem={navigateToTypeaheadItem}
                 creatorItems={typeaheadCreatorItems}
@@ -843,6 +839,7 @@ function SearchTypeahead({
   creatorItems,
   loading,
   pluginSearchError,
+  skillSearchError,
   onHoverItem,
   onSelectItem,
   pluginItems,
@@ -853,6 +850,7 @@ function SearchTypeahead({
   creatorItems: TypeaheadItem[];
   loading: boolean;
   pluginSearchError?: boolean;
+  skillSearchError?: boolean;
   onHoverItem: (index: number) => void;
   onSelectItem: (item: TypeaheadItem) => void;
   pluginItems: TypeaheadItem[];
@@ -886,12 +884,15 @@ function SearchTypeahead({
             <span>Searching…</span>
           </div>
         ) : null}
+        {hasQuery && !loading && skillSearchError ? (
+          <div role="alert">Unable to search skills. Please try again later.</div>
+        ) : null}
         {hasQuery && !loading && pluginSearchError ? (
           <div role="alert" className="navbar-search-typeahead-status">
             Unable to search plugins. Please try again later.
           </div>
         ) : null}
-        {hasQuery && !loading && !hasMatches && !pluginSearchError ? (
+        {hasQuery && !loading && !hasMatches && !pluginSearchError && !skillSearchError ? (
           <div className="navbar-search-typeahead-status">
             No skills, plugins, or creators found for "{query}"
           </div>
