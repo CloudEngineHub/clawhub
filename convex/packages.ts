@@ -109,9 +109,12 @@ import {
 import { insertPackageInstallStatEvent } from "./lib/packageStatEvents";
 import {
   classifyPluginCategories,
+  readPluginCategoryDocumentation,
+} from "./lib/pluginCategoryClassification";
+import {
   pluginCategoryClassificationValidator,
   type PluginCategoryClassification,
-} from "./lib/pluginCategoryClassification";
+} from "./lib/pluginCategoryClassificationContract";
 import { toPublicPublisher } from "./lib/public";
 import {
   assertCanManageOwnedResource,
@@ -9172,12 +9175,15 @@ async function publishPackageImpl(
   let normalizedTopics: string[];
   try {
     if (family === "code-plugin" || family === "bundle-plugin") {
-      const assignment = await classifyPluginCategories({
+      const evidence = {
         name,
-        pluginManifest,
-        packageJson,
-        bundleManifest,
-        documentation: readmeEntry?.text,
+        pluginManifest: storedPluginManifest,
+        packageJson: storedPackageJson,
+        bundleManifest: family === "bundle-plugin" ? storedBundleManifest : undefined,
+      };
+      const assignment = await classifyPluginCategories({
+        ...evidence,
+        documentation: await readPluginCategoryDocumentation(ctx, { ...evidence, files }),
       });
       categories = assignment.categories;
       categoryClassification = assignment.classification;
