@@ -58,7 +58,14 @@ async function sourceRevision(ctx: QueryCtx, request: ReportRequest): Promise<st
     endDay: request.endDay!,
     artifactKind: request.artifactKind,
   });
+  const editorial =
+    request.view === "recommendations" && request.artifactKind === "plugin"
+      ? await ctx.runQuery(internal.featuredSelections.readEditorialInternal, {
+          artifactKind: "plugin",
+        })
+      : null;
   return JSON.stringify([
+    editorial?.revision ?? null,
     state?.revision ?? null,
     classification?._id ?? null,
     classification?.processedAt ?? null,
@@ -73,16 +80,19 @@ async function envelope(
     ? await pool.status(ctx, row.workId as WorkId)
     : { state: "finished" as const };
   const expired = row.expirationTime <= now;
+  const unsupported = row.reportVersion !== REPORT_VERSION;
   return {
     reportId: row._id,
     view: row.request.view,
     status: expired
       ? "expired"
-      : row.state !== "pending"
-        ? row.state
-        : work.state === "finished"
-          ? "incomplete"
-          : work.state,
+      : unsupported
+        ? "incomplete"
+        : row.state !== "pending"
+          ? row.state
+          : work.state === "finished"
+            ? "incomplete"
+            : work.state,
     requestedAt: row.requestedAt,
     completedAt: row.completedAt ?? null,
     expirationTime: row.expirationTime,
@@ -90,8 +100,10 @@ async function envelope(
       work.state === "finished" ? (row.previousAttempts ?? 0) : work.previousAttempts,
     failureCode: expired
       ? "report_expired"
-      : (row.failureCode ??
-        (row.state === "pending" && work.state === "finished" ? "report_incomplete" : null)),
+      : unsupported
+        ? "report_version_unsupported"
+        : (row.failureCode ??
+          (row.state === "pending" && work.state === "finished" ? "report_incomplete" : null)),
     reportVersion: row.reportVersion,
   };
 }
@@ -112,7 +124,10 @@ async function startReport(ctx: MutationCtx, input: ReportRequest): Promise<Sear
   let refreshOf: Id<"searchReportRuns"> | undefined;
   if (input.refreshOf) {
     const parent = await readRun(ctx, input.refreshOf);
-    if (parent.requestKey !== requestKey) throw new ConvexError("refresh_request_mismatch");
+    const parentRequestKey = await hashToken(
+      JSON.stringify([REPORT_VERSION, normalizeReportRequest(parent.request, Date.now())]),
+    );
+    if (parentRequestKey !== requestKey) throw new ConvexError("refresh_request_mismatch");
     refreshOf = parent._id;
     previous = await ctx.db
       .query("searchReportRuns")
@@ -129,6 +144,7 @@ async function startReport(ctx: MutationCtx, input: ReportRequest): Promise<Sear
   if (
     previous &&
     previous.expirationTime > Date.now() &&
+    previous.reportVersion === REPORT_VERSION &&
     (input.refreshOf || previous.sourceRevision === revision)
   )
     return envelope(ctx, previous, Date.now());
@@ -194,6 +210,8 @@ export const generateInternal = internalAction({
         now: Date.now(),
       });
       if (state.status === "ready") return { reportId };
+      if (row.reportVersion !== REPORT_VERSION)
+        throw new NonRetryableError("report_version_unsupported");
       if (state.status === "expired" || state.status === "failed")
         throw new NonRetryableError("report_expired");
       phase = "report_collection_failed";
@@ -323,15 +341,32 @@ export const completedInternal = internalMutation({
   },
 });
 
-export const chunksInternal = internalQuery({
+export const evidenceInternal = internalQuery({
   args: { ...idArgs, now: v.number() },
-  handler: async (ctx, { reportId, now }) => {
+  handler: async (
+    ctx,
+    { reportId, now },
+  ): Promise<{ evidence: ReportEvidence; reportHash: string }> => {
     const row = await readRun(ctx, reportId);
-    if (row.expirationTime <= now || row.state !== "ready") throw new Error("report_unavailable");
-    return ctx.db
+    if (row.expirationTime <= now || row.state !== "ready" || row.reportVersion !== REPORT_VERSION)
+      throw new ConvexError("Saved report unavailable. Generate and review a new report.");
+    const chunks = await ctx.db
       .query("searchReportChunks")
       .withIndex("by_reportId_index", (q) => q.eq("reportId", row._id))
       .take(REPORT_MAX_CHUNKS + 1);
+    if (chunks.length !== row.chunkCount || chunks.some((chunk, index) => chunk.index !== index))
+      throw new ConvexError("Saved report evidence incomplete. Generate a new report.");
+    const bytes = new Uint8Array(row.resultBytes!);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(new Uint8Array(chunk.bytes), offset);
+      offset += chunk.bytes.byteLength;
+    }
+    if (offset !== bytes.length) throw new ConvexError("Saved report evidence incomplete.");
+    const serialized = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    if ((await hashToken(serialized)) !== row.resultHash)
+      throw new ConvexError("Saved report evidence hash changed. Generate a new report.");
+    return { evidence: JSON.parse(serialized) as ReportEvidence, reportHash: row.resultHash! };
   },
 });
 async function getReport(ctx: ActionCtx, reportId: string): Promise<SearchReportResponse> {
@@ -341,26 +376,11 @@ async function getReport(ctx: ActionCtx, reportId: string): Promise<SearchReport
   });
   if (state.status !== "ready") return state as SearchReportResponse;
   try {
-    const chunks = await ctx.runQuery(internal.searchReports.chunksInternal, {
+    const { evidence } = await ctx.runQuery(internal.searchReports.evidenceInternal, {
       reportId,
       now: Date.now(),
     });
-    if (chunks.length !== row.chunkCount || chunks.some((chunk, index) => chunk.index !== index))
-      throw new Error("report_incomplete");
-    const bytes = new Uint8Array(row.resultBytes!);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(new Uint8Array(chunk.bytes), offset);
-      offset += chunk.bytes.byteLength;
-    }
-    if (offset !== bytes.length) throw new Error("report_incomplete");
-    const serialized = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    if ((await hashToken(serialized)) !== row.resultHash) throw new Error("report_incomplete");
-    const rendered = await renderReportEvidence(
-      ctx,
-      JSON.parse(serialized) as ReportEvidence,
-      row.request.limit!,
-    );
+    const rendered = await renderReportEvidence(ctx, evidence, row.request.limit!);
     if (row.expirationTime <= Date.now())
       return { ...state, status: "expired", failureCode: "report_expired" };
     return { ...state, ...rendered, status: "ready" };
