@@ -20,7 +20,6 @@ const FAILURE_CODES = [
   "POLICY_CACHED",
   "POLICY_CACHE_AGE",
   "POLICY_SPOOF_CHANGED",
-  "SOURCE_ENABLED",
   "POLICY_HTTP_STATUS",
   "PREVIEW_READ_FAILED",
   "FIXTURE_LOOKUP_FAILED",
@@ -33,6 +32,7 @@ const FAILURE_CODES = [
   "BROWSER_HOME",
   "SEEDED_GRANT",
   "SDK_PRESENT",
+  "GTAG_PRESENT",
   "UI_OVERRIDE",
   "ASSET_MISSING",
   "ASSET_HTTP_STATUS",
@@ -144,7 +144,6 @@ export async function provePreviewAnalytics(
   expectedSha: string,
   evidence: Record<string, unknown> = {},
 ) {
-  if (GOOGLE_ANALYTICS_ENABLED) throw new PreviewProofFailure("SOURCE_ENABLED");
   const cases: Array<{
     client_country: string;
     status: number;
@@ -184,6 +183,8 @@ export async function provePreviewAnalytics(
   const errors: string[] = [];
   evidence.browser_error_codes = errors;
   evidence.google_attempts = google;
+  const routeFailures: PreviewRouteFailure[] = [];
+  evidence.browser_route_failures = routeFailures;
   let googleCookieNames: string[] = [];
   const pendingRoutes = new Set<Promise<void>>();
   let servedAsset: { path: string; sha256: string } | undefined;
@@ -206,7 +207,7 @@ export async function provePreviewAnalytics(
       { origin, key: ANALYTICS_CHOICE_KEY, version: ANALYTICS_POLICY_VERSION },
     );
     await context.route("**/*", (route) => {
-      const work = routePreviewRequest(route, origin, credential, google, errors);
+      const work = routePreviewRequest(route, origin, credential, google, errors, routeFailures);
       pendingRoutes.add(work);
       return work.finally(() => pendingRoutes.delete(work));
     });
@@ -224,8 +225,19 @@ export async function provePreviewAnalytics(
     await page.waitForTimeout(2000);
     if (await page.locator('script[src*="googletagmanager.com"]').count())
       throw new PreviewProofFailure("SDK_PRESENT");
-    if (await page.getByRole("button", { name: "Google Analytics choices", exact: true }).count())
-      throw new PreviewProofFailure("UI_OVERRIDE");
+    if (
+      await page.evaluate(() => typeof (window as Window & { gtag?: unknown }).gtag !== "undefined")
+    )
+      throw new PreviewProofFailure("GTAG_PRESENT");
+    const choiceUi = await page
+      .getByRole("button", { name: "Google Analytics choices", exact: true })
+      .count();
+    if (!GOOGLE_ANALYTICS_ENABLED && choiceUi) throw new PreviewProofFailure("UI_OVERRIDE");
+    // A granted preference is distinct from collection eligibility: the tracker
+    // independently excludes every preview origin, even when the source is on.
+    evidence.browser_preference = await page.evaluate(
+      () => document.documentElement.dataset.analyticsAllowed ?? null,
+    );
     const asset = await page
       .locator('link[rel="modulepreload"]')
       .evaluateAll((nodes) =>
@@ -267,13 +279,15 @@ export async function provePreviewAnalytics(
   if (errors.length) throw new PreviewProofFailure("BROWSER_RUNTIME_FAILED");
   if (google.length) throw new PreviewProofFailure("GOOGLE_REQUEST");
   return {
-    source_activation: false,
+    source_activation: GOOGLE_ANALYTICS_ENABLED,
     seeded_grant: true,
     google_requests: 0,
     google_cookie_names: googleCookieNames,
     observation_ms: 2000,
     policy_cases: cases,
     served_asset: servedAsset,
+    browser_preference: evidence.browser_preference,
+    browser_route_failures: routeFailures,
   };
 }
 
@@ -324,13 +338,39 @@ export function assertFreshPreviewCache(headers: Headers) {
   return evidence;
 }
 
+type PreviewRouteFailure = {
+  path_class: "unknown" | "home" | "asset" | "api" | "other" | "external" | "google";
+  phase: "classify" | "fetch" | "redirect" | "read" | "fulfill" | "continue" | "abort";
+  status: number | null;
+  elapsed_ms: number;
+};
+
 export async function routePreviewRequest(
   route: Route,
   origin: string,
   credential: string,
   google: Array<{ host: string; path: string }>,
   errors: string[],
+  failures: PreviewRouteFailure[] = [],
+  fetchImpl: typeof fetch = fetch,
 ) {
+  const started = Date.now();
+  let recorded = false;
+  const failure: PreviewRouteFailure = {
+    path_class: "unknown",
+    phase: "classify",
+    status: null,
+    elapsed_ms: 0,
+  };
+  const recordFailure = () => {
+    if (recorded) return;
+    recorded = true;
+    errors.push("BROWSER_ROUTE_FAILED");
+    // Fixed categories only. Never retain a URL, query, redirect location, header,
+    // raw exception, or exception message, including in failed proof receipts.
+    failure.elapsed_ms = Math.min(60_000, Math.max(0, Date.now() - started));
+    if (failures.length < 32) failures.push(failure);
+  };
   try {
     const url = new URL(route.request().url());
     if (
@@ -338,25 +378,61 @@ export async function routePreviewRequest(
         url.hostname,
       )
     ) {
+      failure.path_class = "google";
+      failure.phase = "abort";
       google.push({ host: url.hostname, path: url.pathname });
       await route.abort();
     } else if (url.origin === origin) {
+      failure.path_class =
+        url.pathname === "/"
+          ? "home"
+          : url.pathname.startsWith("/assets/")
+            ? "asset"
+            : url.pathname.startsWith("/api/")
+              ? "api"
+              : "other";
+      failure.phase = "fetch";
       // Existing job credential stays on this origin. Never follow an authenticated
       // redirect or pass it to a third-party browser request; do not record headers.
-      const response = await route.fetch({
-        headers: { ...route.request().headers(), "x-vercel-protection-bypass": credential },
-        maxRedirects: 0,
-        timeout: 20_000,
+      const request = route.request();
+      const postData = request.postDataBuffer();
+      // Use the same native fetch transport as the successful protected HTTP
+      // reads. Reject redirects: the credential must never follow one.
+      const response = await fetchImpl(url.href, {
+        method: request.method(),
+        headers: { ...(await request.allHeaders()), "x-vercel-protection-bypass": credential },
+        body: postData ? Uint8Array.from(postData).buffer : undefined,
+        redirect: "error",
+        signal: AbortSignal.timeout(20_000),
       });
-      if (response.status() >= 300 && response.status() < 400) {
-        errors.push("BROWSER_ROUTE_FAILED");
+      const status = response.status;
+      failure.status = Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
+      if (status >= 300 && status < 400) {
+        failure.phase = "redirect";
+        recordFailure();
         await route.abort();
-      } else await route.fulfill({ response });
-    } else await route.continue();
+      } else {
+        failure.phase = "read";
+        const body = Buffer.from(await response.arrayBuffer());
+        const headers = Object.fromEntries(response.headers);
+        // Fetch decoded the payload; don't ask the browser to decode it again.
+        delete headers["content-encoding"];
+        delete headers["content-length"];
+        delete headers["transfer-encoding"];
+        const cookies = response.headers.getSetCookie();
+        if (cookies.length) headers["set-cookie"] = cookies.join("\n");
+        failure.phase = "fulfill";
+        await route.fulfill({ status, headers, body });
+      }
+    } else {
+      failure.path_class = "external";
+      failure.phase = "continue";
+      await route.continue();
+    }
   } catch {
     // Playwright request errors include header call logs. Discard the entire raw
     // error before it reaches a callback, log, receipt, or uploaded artifact.
-    errors.push("BROWSER_ROUTE_FAILED");
+    recordFailure();
     await route.abort().catch(() => undefined);
   }
 }
